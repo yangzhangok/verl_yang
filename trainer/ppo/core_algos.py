@@ -804,6 +804,11 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
 
     return loss
 
+def no_negative(x: torch.Tensor, advantage: torch.Tensor, ratio: float = 0.2) -> torch.Tensor:
+    mask_rows = advantage[:, 0] < 0
+    out = x.clone()
+    out[mask_rows] = 0
+    return out
 
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
@@ -854,6 +859,7 @@ def compute_policy_loss(
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
+    ratio = no_negative(ratio,advantages)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
