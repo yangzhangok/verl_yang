@@ -996,6 +996,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                bs = len(gen_batch)
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1004,7 +1005,6 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch.meta_info["drop_or_not"] = True
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
@@ -1064,6 +1064,139 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                    rollout_n = self.config.actor_rollout_ref.rollout.n
+                    seq_len = reward_tensor.shape[-1]
+
+                    # Step 0. 检查 shape
+                    assert reward_tensor.shape == (bs * rollout_n, seq_len), \
+                        f"reward_tensor shape mismatch: {reward_tensor.shape}, expected ({bs*rollout_n}, {seq_len})"
+
+                    # Step 1: 判断每条 rollout 是否正确（任意位置为1）
+                    rollout_correct = (reward_tensor == 1).any(dim=1).float()  # [bs * rollout_n]
+
+                    # Step 2: reshape 为 [bs, rollout_n]，方便按 sequence 聚合
+                    rollout_correct = rollout_correct.view(bs, rollout_n)      # [bs, rollout_n]
+
+                    # Step 3: 计算每个 sequence 的正确率
+                    correct_rate = rollout_correct.mean(dim=1)                # [bs]
+
+                    # Step 4: 根据阈值选择 sequence 索引
+                    threshold = 0.6
+                    selected_idx = (correct_rate >= threshold).nonzero(as_tuple=True)[0].tolist()
+                    
+                    
+                    #import ipdb;ipdb.set_trace()
+                    if len(selected_idx) >= 8:
+                        print(f"Regenerating {len(selected_idx)} / {bs} samples with acc >= 0.6")
+                        
+                        
+                        # 选出对应的行
+                        row_idx = []
+                        for idx in selected_idx:
+                            start = idx * rollout_n
+                            end = (idx + 1) * rollout_n
+                            row_idx.extend(range(start, end))
+                        # 取出对应 gen_batch 的子 batch
+                        # 选 batch
+                        # 假设 row_idx 是 list / numpy array / torch tensor
+
+                        # 计算能保留的最大长度（8 的整数倍）
+                        n_floor = len(row_idx) // 8
+                        row_idx = row_idx[: n_floor * 8]   # 保留前 n*8 个元素
+
+                        #print(f"最终 row_idx 长度: {len(row_idx)} (保证是8的倍数)")
+
+                        selected_batch_dict = {k: v[row_idx] for k, v in gen_batch.batch.items()}
+                        selected_batch_td = TensorDict(
+                            selected_batch_dict,
+                            batch_size=torch.Size([len(row_idx)])
+                        )
+
+                        # 选 non_tensor_batch
+                        selected_non_tensor_batch = {k: v[row_idx] for k, v in gen_batch.non_tensor_batch.items()}
+
+                        # 选 meta_info
+                        # import ipdb;ipdb.set_trace()    
+                        selected_meta_info = {}
+                        for k, v in gen_batch.meta_info.items():
+                            if isinstance(v, (list, np.ndarray, torch.Tensor)):
+                                selected_meta_info[k] = v[row_idx]
+                            else:
+                                # 标量或全局信息，保持原值
+                                selected_meta_info[k] = v
+                        #selected_meta_info = {k: v[row_idx] for k, v in gen_batch.meta_info.items()}
+
+                        #import ipdb;ipdb.set_trace()
+                        # 生成新的 DataProto
+                        selected_batch_proto = DataProto(
+                            batch=selected_batch_td,
+                            non_tensor_batch=selected_non_tensor_batch,
+                            meta_info=selected_meta_info
+                        )
+                        
+
+                        # 重新生成
+                        print("\ncode here\n",len(selected_idx))
+                        selected_batch_proto.meta_info["drop_or_not"] = True
+                        new_gen_output = self.actor_rollout_wg.generate_sequences(selected_batch_proto)
+
+                        # 替换掉原有位置的 gen_batch_output
+                        # gen_batch_output.batch 是 [bs*rollout_n, ...]
+                        # 我们需要按 rollout_n 对应地替换
+                        # row_idx: 对应要替换的 rollout 行索引
+                        for k in gen_batch_output.batch.keys():
+                            gen_batch_output.batch[k][row_idx] = new_gen_output.batch[k]
+
+                        for k in gen_batch_output.non_tensor_batch.keys():
+                            gen_batch_output.non_tensor_batch[k][row_idx] = new_gen_output.non_tensor_batch[k]
+
+                        for k, v in gen_batch_output.meta_info.items():
+                            new_v = new_gen_output.meta_info[k]
+                        
+                            if isinstance(v, (torch.Tensor, np.ndarray, list)):
+                                # ✅ 对可索引类型做替换
+                                for i, idx in enumerate(row_idx):
+                                    if isinstance(v, torch.Tensor):
+                                        v[idx] = new_v[i]
+                                    elif isinstance(v, np.ndarray):
+                                        v[idx] = new_v[i]
+                                    elif isinstance(v, list):
+                                        v[idx] = new_v[i]
+                            else:
+                                # ❌ 如果是标量 (int/float/str)，就直接整体替换
+                                gen_batch_output.meta_info[k] = new_v
+                        
+                        # for k in gen_batch_output.meta_info.keys():
+                        #     gen_batch_output.meta_info[k][row_idx] = new_gen_output.meta_info[k]
+
+
+                        batch = old_batch.union(gen_batch_output)
+
+                        if "response_mask" not in batch.batch.keys():
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+                        # Balance the number of valid tokens across DP ranks.
+                        # NOTE: This usually changes the order of data in the `batch`,
+                        # which won't affect the advantage calculation (since it's based on uid),
+                        # but might affect the loss calculation (due to the change of mini-batching).
+                        # TODO: Decouple the DP balancing and mini-batching.
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+
+                        # compute global_valid tokens
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
