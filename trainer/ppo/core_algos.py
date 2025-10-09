@@ -804,8 +804,26 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
 
     return loss
 
-def no_negative(x: torch.Tensor, advantage: torch.Tensor, ratio: float = 0.2) -> torch.Tensor:
+def no_negative(x: torch.Tensor, advantage: torch.Tensor,log_file: str = None) -> torch.Tensor:
     mask_rows = advantage[:, 0] < 0
+    
+    # 2. (新增功能) 计算并保存比例
+    if log_file:
+        total_rows = advantage.shape[0]
+        # 计算被屏蔽的行数 (True 的数量)
+        masked_rows_count = torch.sum(mask_rows).item()
+        # 计算比例
+        masked_ratio = masked_rows_count / total_rows
+
+        # 以追加模式 ('a') 打开文件并写入比例
+        # 'with' 语句能确保文件被正确关闭
+        try:
+            with open(log_file, 'a') as f:
+                # 写入比例值并换行
+                f.write(f"{masked_ratio}\n")
+        except IOError as e:
+            print(f"警告：无法写入日志文件 {log_file}。错误: {e}")
+    
     out = x.clone()
     out[mask_rows] = 0
     return out
@@ -859,7 +877,7 @@ def compute_policy_loss(
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    #ratio = no_negative(ratio,advantages)
+    ratio = no_negative(ratio,advantages,"/data/250010046/verl-main/log_file/no_negative.txt")
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
