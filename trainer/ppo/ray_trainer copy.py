@@ -184,7 +184,6 @@ def compute_advantage(
     gamma: float = 1.0,
     lam: float = 1.0,
     num_repeat: int = 1,
-    his_mean:float = 0.0,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
@@ -1054,7 +1053,6 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
-                            import ipdb;ipdb.set_trace()
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
