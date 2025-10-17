@@ -236,6 +236,7 @@ def compute_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
+            his_mean = his_mean,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         data.batch["advantages"] = advantages
@@ -972,6 +973,9 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        self.his_mean = 0.0
+        self.his_count = 0
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1054,8 +1058,15 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
-                            import ipdb;ipdb.set_trace()
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            with torch.no_grad():
+                                batch_sum = reward_tensor.sum()
+                                n_batch = reward_tensor.shape[0]
+                                b = batch_sum / n_batch  # 本批均值
+
+                                # overall mean 在线更新
+                                self.his_mean = (self.his_mean * self.his_count + batch_sum) / (self.his_count + n_batch)
+                                self.his_count += n_batch
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1120,6 +1131,7 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            his_mean = self.his_mean,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
