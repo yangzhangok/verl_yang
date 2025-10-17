@@ -482,8 +482,6 @@ class RayPPOTrainer:
         if generations_to_log == 0:
             return
 
-        import numpy as np
-
         # Create tuples of (input, output, score) and sort by input text
         samples = list(zip(inputs, outputs, scores, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
@@ -993,19 +991,198 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                
+                # Instead of simple repeat, create two different shuffle versions
+                n_samples = self.config.actor_rollout_ref.rollout.n
+                n_samples_per_shuffle = n_samples // 2
+                
+                # Create two copies of gen_batch for different shuffles
+                gen_batch_shuffle1 = deepcopy(gen_batch)
+                gen_batch_shuffle2 = deepcopy(gen_batch)
+                
+                # Convert multi_modal_inputs to multi_modal_data format for vLLM
+                if "multi_modal_inputs" in gen_batch.non_tensor_batch:
+                    multi_modal_data_list = []
+                    
+                    # Get the underlying Qwen2_5_VLForConditionalGeneration model for visual processing
+                    try:
+                        if hasattr(self.actor_rollout_wg, 'inference_engine'):
+                            # Access the underlying model through vLLM's internal structure
+                            if hasattr(self.actor_rollout_wg.inference_engine, 'llm_engine'):
+                                # Synchronous mode
+                                model = self.actor_rollout_wg.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+                            else:
+                                # Asynchronous mode
+                                model = self.actor_rollout_wg.inference_engine.worker.model_runner.model
+                            
+                            # Check if the model has visual method (Qwen2_5_VLForConditionalGeneration)
+                            if hasattr(model, 'visual'):
+                                for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
+                                    # Extract pixel_values and image_grid_thw from multi_modal_input
+                                    pixel_values = multi_modal_input["pixel_values"]  # torch.Tensor
+                                    image_grid_thw = multi_modal_input["image_grid_thw"]  # torch.Tensor
+                                    
+                                    # Move tensors to the same device as the model
+                                    device = next(model.parameters()).device
+                                    pixel_values = pixel_values.to(device)
+                                    image_grid_thw = image_grid_thw.to(device)
+                                    
+                                    # Use Qwen2_5_VLForConditionalGeneration's visual method to process images
+                                    with torch.no_grad():
+                                        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+                                    
+                                    # Convert to CPU tensors as required by vLLM
+                                    image_embeds_cpu = image_embeds.cpu()
+                                    image_grid_thw_cpu = image_grid_thw.cpu()
+                                    
+                                    # Create multi_modal_data in the format expected by vLLM
+                                    multi_modal_data = {
+                                        "image": {
+                                            "image_embeds": image_embeds_cpu,      # torch.Tensor, (N, F, H) - CPU
+                                            "image_grid_thw": image_grid_thw_cpu,  # torch.Tensor, (N, 3) - CPU
+                                        }
+                                    }
+                                    multi_modal_data_list.append(multi_modal_data)
+                            else:
+                                raise AttributeError("Model does not have visual method")
+                        else:
+                            raise AttributeError("actor_rollout_wg does not have inference_engine")
+                            
+                    except Exception as e:
+                        print(f"Warning: Failed to process multi_modal_inputs with Qwen2_5_VLForConditionalGeneration: {e}")
+                        print("Falling back to simple pixel_values conversion...")
+                        
+                        # Fallback: use pixel_values directly (not recommended but better than crashing)
+                        for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
+                            pixel_values = multi_modal_input["pixel_values"]
+                            image_grid_thw = multi_modal_input["image_grid_thw"]
+                            
+                            multi_modal_data = {
+                                "image": {
+                                    "image_embeds": pixel_values.cpu(),
+                                    "image_grid_thw": image_grid_thw.cpu(),
+                                }
+                            }
+                            multi_modal_data_list.append(multi_modal_data)
+                    
+                    # Replace multi_modal_inputs with multi_modal_data
+                    gen_batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
+                    del gen_batch.non_tensor_batch["multi_modal_inputs"]
+                    
+                    # Create two different shuffle versions
+                    def create_shuffled_gen_batch(base_gen_batch, shuffle_seed):
+                        """Create a shuffled version of gen_batch with given seed"""
+                        shuffled_gen_batch = deepcopy(base_gen_batch)
+                        
+                        if "multi_modal_data" in shuffled_gen_batch.non_tensor_batch:
+                            import torch
+                            
+                            # Set random seed for reproducible shuffle
+                            torch.manual_seed(shuffle_seed)
+                            
+                            input_ids = shuffled_gen_batch.batch["input_ids"]  # Shape: (batch_size, seq_len)
+                            position_ids = shuffled_gen_batch.batch["position_ids"]  # Shape: (batch_size, seq_len, pos_dim)
+                            multi_modal_data_list = shuffled_gen_batch.non_tensor_batch["multi_modal_data"]
+                            
+                            batch_size = input_ids.shape[0]
+                            
+                            # Get spatial_merge_size from model config (default is 2 for 2x2 merging)
+                            spatial_merge_size = 2  # Qwen2.5-VL default spatial merge size
+                            
+                            # Process each sample in the batch
+                            for batch_idx in range(batch_size):
+                                # Find positions where input_ids == 151655 (image token)
+                                image_token_mask = input_ids[batch_idx] == 151655
+                                image_token_positions = torch.where(image_token_mask)[0]
+                                
+                                if len(image_token_positions) > 0:
+                                    # Get the corresponding image_embeds for this sample
+                                    image_embeds = multi_modal_data_list[batch_idx]["image"]["image_embeds"]
+                                    image_grid_thw = multi_modal_data_list[batch_idx]["image"]["image_grid_thw"]
+                                    
+                                    # Calculate expected number of tokens after spatial merging
+                                    # image_grid_thw is (t, h, w) where t=1 for images
+                                    t, h, w = image_grid_thw[0], image_grid_thw[1], image_grid_thw[2]
+                                    total_patches = t * h * w
+                                    expected_tokens = total_patches // (spatial_merge_size ** 2)
+                                    
+                                    num_image_tokens = len(image_token_positions)
+                                    
+                                    # Check if image_embeds has 4x the number of image tokens (due to 2x2 spatial merging)
+                                    if image_embeds.shape[0] == num_image_tokens * 4:
+                                        # Generate random permutation indices for token groups
+                                        perm_indices = torch.randperm(num_image_tokens)
+                                        
+                                        # Reshape image_embeds to group every 4 rows together
+                                        # image_embeds shape: (num_image_tokens * 4, embed_dim)
+                                        # Reshape to: (num_image_tokens, 4, embed_dim)
+                                        grouped_embeds = image_embeds.view(num_image_tokens, 4, -1)
+                                        
+                                        # Shuffle the groups (not individual rows)
+                                        shuffled_grouped_embeds = grouped_embeds[perm_indices]
+                                        
+                                        # Reshape back to original shape
+                                        shuffled_image_embeds = shuffled_grouped_embeds.view(num_image_tokens * 4, -1)
+                                        
+                                        # Update the multi_modal_data with shuffled image_embeds
+                                        multi_modal_data_list[batch_idx]["image"]["image_embeds"] = shuffled_image_embeds
+                                        
+                                        # Shuffle the corresponding position_ids at image token positions
+                                        # position_ids[batch_idx] has shape (seq_len, pos_dim)
+                                        # We need to shuffle the rows at image_token_positions
+                                        original_positions = position_ids[batch_idx][image_token_positions]  # Shape: (num_image_tokens, pos_dim)
+                                        shuffled_positions = original_positions[perm_indices]
+                                        
+                                        # Update position_ids with shuffled positions
+                                        position_ids[batch_idx][image_token_positions] = shuffled_positions
+                                        
+                                        print(f"Shuffle {shuffle_seed}, Sample {batch_idx}: Shuffled {num_image_tokens} image token groups (grid: {h}x{w}, patches: {total_patches}, embeds: {image_embeds.shape[0]} rows)")
+                                    else:
+                                        print(f"Warning: Shuffle {shuffle_seed}, Sample {batch_idx}: Expected {num_image_tokens * 4} embed rows for {num_image_tokens} tokens, but found {image_embeds.shape[0]} rows (grid: {h}x{w}, patches: {total_patches})")
+                        
+                        return shuffled_gen_batch
+                    
+                    # Create two different shuffle versions with different seeds
+                    gen_batch_shuffle1 = create_shuffled_gen_batch(gen_batch, shuffle_seed=42)
+                    gen_batch_shuffle2 = create_shuffled_gen_batch(gen_batch, shuffle_seed=123)
+                
+                import ipdb;ipdb.set_trace()
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # Generate sequences for both shuffle versions
                     with marked_timer("gen", timing_raw, color="red"):
+                        # Repeat each shuffle version to generate n/2 samples
+                        gen_batch_shuffle1_repeated = gen_batch_shuffle1.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
+                        gen_batch_shuffle2_repeated = gen_batch_shuffle2.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
+                        
+                        # Generate sequences for shuffle1
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output1 = self.actor_rollout_wg.generate_sequences(gen_batch_shuffle1_repeated)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output1 = self.async_rollout_manager.generate_sequences(gen_batch_shuffle1_repeated)
+                        
+                        # Generate sequences for shuffle2
+                        if not self.async_rollout_mode:
+                            gen_batch_output2 = self.actor_rollout_wg.generate_sequences(gen_batch_shuffle2_repeated)
+                        else:
+                            gen_batch_output2 = self.async_rollout_manager.generate_sequences(gen_batch_shuffle2_repeated)
+                        
+                        # Create cross-correspondence: shuffle1 batch with shuffle2 output, and vice versa
+                        # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
+                        gen_batch_output_cross1 = gen_batch_output2  # shuffle1 batch with shuffle2 output
+                        gen_batch_output_cross2 = gen_batch_output1  # shuffle2 batch with shuffle1 output
+                        
+                        # Combine the cross-corresponded outputs
+                        gen_batch_output = gen_batch_output_cross1.union(gen_batch_output_cross2)
+                        
+                        # Update timing info
+                        timing_raw.update(gen_batch_output1.meta_info["timing"])
+                        timing_raw.update(gen_batch_output2.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        
+                        print(f"Cross-correspondence: shuffle1 batch with shuffle2 output, shuffle2 batch with shuffle1 output")
+                        print(f"Generated {n_samples_per_shuffle} samples from each shuffle with cross-correspondence")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1027,9 +1204,49 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    # repeat to align with repeated responses in rollout with cross-correspondence
+                    # Create cross-corresponded batch: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
+                    batch_shuffle1 = gen_batch_shuffle1.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
+                    batch_shuffle2 = gen_batch_shuffle2.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
+                    
+                    # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
+                    batch_cross1 = batch_shuffle1.union(gen_batch_output2)  # shuffle1 batch with shuffle2 output
+                    batch_cross2 = batch_shuffle2.union(gen_batch_output1)  # shuffle2 batch with shuffle1 output
+                    
+                    # Combine the cross-corresponded batches
+                    # Handle potential conflicts in meta_info and non_tensor_batch
+                    batch = batch_cross1.union(batch_cross2)
+                    
+                    # Ensure all necessary attributes are preserved
+                    # Check if any critical attributes are missing and handle them
+                    if "timing" in batch_cross1.meta_info and "timing" in batch_cross2.meta_info:
+                        # Merge timing information from both batches
+                        timing1 = batch_cross1.meta_info["timing"]
+                        timing2 = batch_cross2.meta_info["timing"]
+                        merged_timing = {**timing1, **timing2}
+                        batch.meta_info["timing"] = merged_timing
+                    
+                    # Ensure multi_modal_data is preserved if present
+                    if "multi_modal_data" in batch_cross1.non_tensor_batch or "multi_modal_data" in batch_cross2.non_tensor_batch:
+                        # multi_modal_data should be consistent between cross batches due to same input
+                        if "multi_modal_data" not in batch.non_tensor_batch:
+                            if "multi_modal_data" in batch_cross1.non_tensor_batch:
+                                batch.non_tensor_batch["multi_modal_data"] = batch_cross1.non_tensor_batch["multi_modal_data"]
+                            elif "multi_modal_data" in batch_cross2.non_tensor_batch:
+                                batch.non_tensor_batch["multi_modal_data"] = batch_cross2.non_tensor_batch["multi_modal_data"]
+                    
+                    # Ensure raw_prompt_ids is preserved
+                    if "raw_prompt_ids" in batch_cross1.non_tensor_batch or "raw_prompt_ids" in batch_cross2.non_tensor_batch:
+                        if "raw_prompt_ids" not in batch.non_tensor_batch:
+                            if "raw_prompt_ids" in batch_cross1.non_tensor_batch:
+                                batch.non_tensor_batch["raw_prompt_ids"] = batch_cross1.non_tensor_batch["raw_prompt_ids"]
+                            elif "raw_prompt_ids" in batch_cross2.non_tensor_batch:
+                                batch.non_tensor_batch["raw_prompt_ids"] = batch_cross2.non_tensor_batch["raw_prompt_ids"]
+                    
+                    print(f"Combined cross-corresponded batches: batch_size={batch.batch_size}, keys={list(batch.batch.keys())}")
+                    print(f"Non-tensor keys: {list(batch.non_tensor_batch.keys())}")
+                    print(f"Meta info keys: {list(batch.meta_info.keys())}")
+                    import ipdb;ipdb.set_trace()
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

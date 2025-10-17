@@ -315,6 +315,7 @@ class DataParallelPPOActor(BasePPOActor):
         # set to eval
         self.actor_module.eval()
 
+        import ipdb;ipdb.set_trace()
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
