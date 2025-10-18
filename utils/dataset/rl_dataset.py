@@ -88,6 +88,7 @@ class RLHFDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
+        model: Optional[object] = None,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -96,6 +97,7 @@ class RLHFDataset(Dataset):
         self.original_data_files = copy.deepcopy(data_files)  # use for resume
         self.tokenizer = tokenizer
         self.processor = processor
+        self.model = model
         self.config = config
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
@@ -273,6 +275,38 @@ class RLHFDataset(Dataset):
 
                 # second_per_grid_ts isn't used for training, just for mrope
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
+                
+                # Convert images to embeddings if model is available
+                if self.model is not None and hasattr(self.model, 'visual') and "pixel_values" in row_dict["multi_modal_inputs"]:
+                    
+                    pixel_values = row_dict["multi_modal_inputs"]["pixel_values"]
+                    image_grid_thw = row_dict["multi_modal_inputs"].get("image_grid_thw")
+                    
+                    # Debug: Print shapes to understand the data structure
+                    # print(f"pixel_values.shape: {pixel_values.shape}")
+                    # print(f"image_grid_thw.shape: {image_grid_thw.shape}")
+                    
+                    # Process images - pixel_values.shape[0] is batch_size (should be 1 for __getitem__)
+                    # Since __getitem__ processes single data point, batch_size should be 1
+                    
+                    # Ensure data is on the same device as the model
+                    model_device = next(self.model.parameters()).device
+                    pixel_values = pixel_values.to(model_device)
+                    if image_grid_thw is not None:
+                        image_grid_thw = image_grid_thw.to(model_device)
+                    
+                    with torch.no_grad():
+                        if image_grid_thw is not None:
+                            # For Qwen2.5VL, pass thw information if available
+                            # single_thw[0] extracts [T, H, W] from [1, 3]
+                            image_embedding = self.model.visual(pixel_values, image_grid_thw)
+                        else:
+                            image_embedding = self.model.visual(pixel_values)
+                    
+                    # Replace pixel_values with embeddings
+                    row_dict["multi_modal_inputs"]["image_embeddings"] = image_embedding
+                    # Remove original pixel_values to save memory
+                    row_dict["multi_modal_inputs"].pop("pixel_values", None)
 
         else:
             if self.apply_chat_template_kwargs.get("chat_template") is None:

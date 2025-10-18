@@ -1019,62 +1019,18 @@ class RayPPOTrainer:
                 if "multi_modal_inputs" in gen_batch.non_tensor_batch:
                     multi_modal_data_list = []
                     
-                    # Process multi_modal_inputs using Qwen2VL model's visual component
-                    try:
-                        if self.qwen_model is not None:
-                            # Use Qwen2VL model to convert pixel_values to visual tokens
-                            for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
-                                pixel_values = multi_modal_input["pixel_values"]  # torch.Tensor
-                                image_grid_thw = multi_modal_input["image_grid_thw"]  # torch.Tensor
-                                
-                                # Move pixel_values to the same device as the model
-                                if hasattr(self.qwen_model, 'device'):
-                                    pixel_values = pixel_values.to(self.qwen_model.device)
-                                
-                                # Use the visual component to convert pixel_values to visual tokens
-                                with torch.no_grad():
-                                    # Get visual tokens from the model's visual component
-                                    visual_tokens = self.qwen_model.visual(pixel_values)
-                                
-                                # Create multi_modal_data with visual tokens instead of pixel_values
-                                multi_modal_data = {
-                                    "image": {
-                                        "image_embeds": visual_tokens.cpu(),  # Use visual tokens
-                                        "image_grid_thw": image_grid_thw.cpu(),
-                                    }
-                                }
-                                multi_modal_data_list.append(multi_modal_data)
-                        else:
-                            # Fallback: use pixel_values directly if model is not available
-                            print("Warning: Qwen2VL model not available, using pixel_values directly")
-                            for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
-                                pixel_values = multi_modal_input["pixel_values"]
-                                image_grid_thw = multi_modal_input["image_grid_thw"]
-                                
-                                multi_modal_data = {
-                                    "image": {
-                                        "pixel_values": pixel_values,
-                                        "image_grid_thw": image_grid_thw,
-                                    }
-                                }
-                                multi_modal_data_list.append(multi_modal_data)
-                            
-                    except Exception as e:
-                        print(f"Warning: Failed to process multi_modal_inputs with Qwen2VL model: {e}")
-                        print("Falling back to simple pixel_values conversion...")
-                        
-                        # Fallback: use pixel_values directly (not recommended but better than crashing)
-                        for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
-                            pixel_values = multi_modal_input["pixel_values"]
-                            image_grid_thw = multi_modal_input["image_grid_thw"]
-                            
-                            multi_modal_data = {
-                                "image": {
-                                    "image_embeds": pixel_values.cpu(),
-                                    "image_grid_thw": image_grid_thw.cpu(),
-                                }
+                    # Since image embedding is now handled in the dataset, 
+                    # we just need to convert the format from multi_modal_inputs to multi_modal_data
+                    for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
+                        # The dataset has already processed pixel_values into image_embeds
+                        # We just need to preserve the structure
+                        multi_modal_data = {
+                            "image": {
+                                "image_embeds": multi_modal_input["image_embeds"],  # Already processed by dataset
+                                "image_grid_thw": multi_modal_input["image_grid_thw"],
                             }
-                            multi_modal_data_list.append(multi_modal_data)
+                        }
+                        multi_modal_data_list.append(multi_modal_data)
                     
                     # Replace multi_modal_inputs with multi_modal_data
                     gen_batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
@@ -1086,7 +1042,6 @@ class RayPPOTrainer:
                         shuffled_gen_batch = deepcopy(base_gen_batch)
                         
                         if "multi_modal_data" in shuffled_gen_batch.non_tensor_batch:
-                            import torch
                             
                             # Set random seed for reproducible shuffle
                             torch.manual_seed(shuffle_seed)
@@ -1107,42 +1062,12 @@ class RayPPOTrainer:
                                     # Get the corresponding image data for this sample
                                     image_data = multi_modal_data_list[batch_idx]["image"]
                                     
-                                    # Check if we have pixel_values that need to be converted to image_embeds
-                                    if "pixel_values" in image_data:
-                                        # In a distributed training environment, we cannot directly access the model
-                                        # Instead, we'll shuffle the pixel_values directly and let vLLM handle the conversion
-                                        pixel_values = image_data["pixel_values"]
-                                        image_grid_thw = image_data["image_grid_thw"]
-                                        
-                                        num_image_tokens = len(image_token_positions)
-                                        
-                                        # For pixel_values, we assume each image token corresponds to one image
-                                        # We need to check if the number of images matches the number of tokens
-                                        if pixel_values.shape[0] == num_image_tokens:
-                                            # Generate random permutation indices for shuffling
-                                            perm_indices = torch.randperm(num_image_tokens)
-                                            
-                                            # Shuffle the pixel_values
-                                            shuffled_pixel_values = pixel_values[perm_indices]
-                                            
-                                            # Update the multi_modal_data with shuffled pixel_values
-                                            multi_modal_data_list[batch_idx]["image"]["pixel_values"] = shuffled_pixel_values
-                                            
-                                            # Shuffle the corresponding position_ids at image token positions
-                                            original_positions = position_ids[batch_idx][:, image_token_positions]
-                                            shuffled_positions = original_positions[:, perm_indices]
-                                            position_ids[batch_idx][:, image_token_positions] = shuffled_positions
-                                            
-                                            print(f"Shuffle {shuffle_seed}, Sample {batch_idx}: Shuffled {num_image_tokens} image tokens (pixel_values: {pixel_values.shape[0]} images)")
-                                        else:
-                                            print(f"Warning: Shuffle {shuffle_seed}, Sample {batch_idx}: Expected {num_image_tokens} images for {num_image_tokens} tokens, but found {pixel_values.shape[0]} images")
-                                    
-                                    elif "image_embeds" in image_data:
-                                        # Already have image_embeds, use the original logic
+                                    # Now we expect image_embeds to be already processed by the dataset
+                                    if "image_embeds" in image_data:
                                         image_embeds = image_data["image_embeds"]
                                         num_image_tokens = len(image_token_positions)
                                         
-                                        # After visual() processing, image_embeds should have the same number of rows as image tokens
+                                        # After dataset processing, image_embeds should have the same number of rows as image tokens
                                         if image_embeds.shape[0] == num_image_tokens:
                                             # Generate random permutation indices for shuffling
                                             perm_indices = torch.randperm(num_image_tokens)
@@ -1165,6 +1090,8 @@ class RayPPOTrainer:
                                             print(f"Shuffle {shuffle_seed}, Sample {batch_idx}: Shuffled {num_image_tokens} image tokens (embeds: {image_embeds.shape[0]} rows)")
                                         else:
                                             print(f"Warning: Shuffle {shuffle_seed}, Sample {batch_idx}: Expected {num_image_tokens} embed rows for {num_image_tokens} tokens, but found {image_embeds.shape[0]} rows")
+                                    else:
+                                        print(f"Warning: Shuffle {shuffle_seed}, Sample {batch_idx}: No image_embeds found in multi_modal_data")
                         
                         return shuffled_gen_batch
                     
