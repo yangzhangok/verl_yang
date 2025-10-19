@@ -167,6 +167,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                import ipdb; ipdb.set_trace()
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
