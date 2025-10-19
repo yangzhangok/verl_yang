@@ -70,6 +70,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        
+        # Debug: Print Ulysses configuration
+        if torch.distributed.get_rank() == 0:
+            print(f"Ulysses sequence parallel size: {self.ulysses_sequence_parallel_size}")
+            print(f"Use Ulysses SP: {self.use_ulysses_sp}")
 
         if self.config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
@@ -82,6 +87,177 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+        # 注意：视觉模块的 FSDP 配置应该在 fsdp_workers.py 中处理
+        # 这里不再进行额外的 FSDP 包装，避免双重包装问题
+        if torch.distributed.get_rank() == 0:
+            print(f"Visual module type: {type(self.actor_module.visual)}")
+            print(f"Visual module is FSDP wrapped: {hasattr(self.actor_module.visual, '_fsdp_wrapped_module')}")
+
+    def process_pixel_values_to_embeddings(self, multi_modal_inputs: dict) -> dict:
+        """
+        Process pixel_values to image embeddings using the actor module's visual encoder.
+        
+        This function converts pixel_values to image embeddings using the model's visual component,
+        which is already loaded on GPU. This avoids the need to load a separate visual model
+        and leverages the existing actor_module for processing.
+        
+        Args:
+            multi_modal_inputs (dict): Dictionary containing multi-modal inputs with pixel_values
+            
+        Returns:
+            dict: Updated multi_modal_inputs with image_embeddings instead of pixel_values
+        """
+        if "pixel_values" not in multi_modal_inputs:
+            return multi_modal_inputs
+        
+        pixel_values = multi_modal_inputs["pixel_values"]
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        
+        # Ensure pixel_values is on the correct device
+        if pixel_values.device != self.actor_module.device:
+            pixel_values = pixel_values.to(self.actor_module.device)
+        
+        if image_grid_thw is not None and image_grid_thw.device != self.actor_module.device:
+            image_grid_thw = image_grid_thw.to(self.actor_module.device)
+        
+        # Set model to eval mode for inference
+        was_training = self.actor_module.training
+        self.actor_module.eval()
+        
+        try:
+            with torch.no_grad():
+                # Debug: Print pixel_values shape and dtype
+                print(f"DEBUG: pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                if image_grid_thw is not None:
+                    print(f"DEBUG: image_grid_thw shape: {image_grid_thw.shape}, dtype: {image_grid_thw.dtype}")
+                
+                # Use the model's visual encoder to process pixel_values
+                if hasattr(self.actor_module, 'visual'):
+                    # Direct access to visual encoder (FSDP wrapped)
+                    # Convert pixel_values to the correct dtype for visual encoder
+                    pixel_values = pixel_values.type(self.actor_module.visual.dtype)
+                    print(f"DEBUG: After dtype conversion - pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                    
+                    # FSDP 会自动处理权重聚合，无需手动干预
+                    if image_grid_thw is not None:
+                        image_embeddings = self.actor_module.visual(pixel_values, grid_thw=image_grid_thw)
+                    else:
+                        image_embeddings = self.actor_module.visual(pixel_values)
+                elif hasattr(self.actor_module, 'module') and hasattr(self.actor_module.module, 'visual'):
+                    # FSDP wrapped model
+                    # Convert pixel_values to the correct dtype for visual encoder
+                    pixel_values = pixel_values.type(self.actor_module.module.visual.dtype)
+                    
+                    if image_grid_thw is not None:
+                        image_embeddings = self.actor_module.module.visual(pixel_values, grid_thw=image_grid_thw)
+                    else:
+                        image_embeddings = self.actor_module.module.visual(pixel_values)
+                else:
+                    # Try to find visual encoder in model structure
+                    model = getattr(self.actor_module, 'module', self.actor_module)
+                    if hasattr(model, 'model') and hasattr(model.model, 'visual'):
+                        # Convert pixel_values to the correct dtype for visual encoder
+                        pixel_values = pixel_values.type(model.model.visual.dtype)
+                        
+                        if image_grid_thw is not None:
+                            image_embeddings = model.model.visual(pixel_values, grid_thw=image_grid_thw)
+                        else:
+                            image_embeddings = model.model.visual(pixel_values)
+                    else:
+                        raise AttributeError("Could not find visual encoder in actor_module")
+                
+                logger.debug(f"Processed pixel_values shape {pixel_values.shape} to embeddings shape {image_embeddings.shape}")
+                
+                # Update multi_modal_inputs with embeddings
+                updated_inputs = multi_modal_inputs.copy()
+                updated_inputs["image_embeddings"] = image_embeddings
+                
+                # Remove pixel_values and image_grid_thw to save memory
+                updated_inputs.pop("pixel_values", None)
+                updated_inputs.pop("image_grid_thw", None)
+                
+                return updated_inputs
+                
+        finally:
+            # Restore original training mode
+            if was_training:
+                self.actor_module.train()
+
+    def process_batch_pixel_values_to_embeddings(self, batch_multi_modal_inputs: list) -> list:
+        """
+        Process a batch of multi-modal inputs to convert pixel_values to embeddings.
+        
+        This function efficiently processes multiple samples in batch, which is more efficient
+        than processing them one by one. It collects all pixel_values, processes them together,
+        and then distributes the results back to individual samples.
+        
+        Args:
+            batch_multi_modal_inputs (list): List of multi-modal input dictionaries
+            
+        Returns:
+            list: Updated list of multi-modal inputs with image_embeddings
+        """
+        if not batch_multi_modal_inputs:
+            return batch_multi_modal_inputs
+        
+        # Collect all pixel_values and their metadata
+        pixel_values_list = []
+        image_grid_thw_list = []
+        valid_indices = []
+        
+        for i, multi_modal_inputs in enumerate(batch_multi_modal_inputs):
+            if "pixel_values" in multi_modal_inputs:
+                pixel_values_list.append(multi_modal_inputs["pixel_values"])
+                image_grid_thw_list.append(multi_modal_inputs.get("image_grid_thw"))
+                valid_indices.append(i)
+        
+        if not pixel_values_list:
+            return batch_multi_modal_inputs
+        
+        # Batch process all pixel_values together
+        try:
+            # Stack pixel_values for batch processing
+            batched_pixel_values = torch.stack(pixel_values_list)
+            
+            # Stack image_grid_thw if available
+            batched_image_grid_thw = None
+            if image_grid_thw_list and all(thw is not None for thw in image_grid_thw_list):
+                batched_image_grid_thw = torch.stack(image_grid_thw_list)
+            
+            # Process the batch
+            processed_batch = self.process_pixel_values_to_embeddings({
+                "pixel_values": batched_pixel_values,
+                "image_grid_thw": batched_image_grid_thw
+            })
+            
+            # Extract embeddings
+            batched_embeddings = processed_batch["image_embeddings"]
+            
+            # Distribute embeddings back to individual samples
+            result = batch_multi_modal_inputs.copy()
+            for i, valid_idx in enumerate(valid_indices):
+                # Get the embedding for this sample
+                sample_embedding = batched_embeddings[i]
+                
+                # Update the sample
+                updated_inputs = result[valid_idx].copy()
+                updated_inputs["image_embeddings"] = sample_embedding
+                updated_inputs.pop("pixel_values", None)
+                updated_inputs.pop("image_grid_thw", None)
+                result[valid_idx] = updated_inputs
+            
+            logger.debug(f"Batch processed {len(pixel_values_list)} pixel_values to embeddings")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in batch processing pixel_values: {e}")
+            # Fallback to individual processing
+            logger.info("Falling back to individual processing")
+            result = []
+            for multi_modal_inputs in batch_multi_modal_inputs:
+                result.append(self.process_pixel_values_to_embeddings(multi_modal_inputs))
+            return result
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -494,3 +670,26 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+
+# Usage Example:
+# 
+# To integrate pixel_values to embeddings processing in your training pipeline:
+# 
+# 1. In your actor worker initialization, ensure the actor_module has visual capabilities
+# 2. Before calling _forward_micro_batch, process multi_modal_inputs:
+# 
+#    # Process single sample
+#    processed_inputs = actor.process_pixel_values_to_embeddings(multi_modal_inputs)
+#    
+#    # Or process a batch of samples (more efficient)
+#    batch_processed_inputs = actor.process_batch_pixel_values_to_embeddings(batch_multi_modal_inputs)
+# 
+# 3. The processed inputs will have 'image_embeddings' instead of 'pixel_values'
+# 4. This integrates seamlessly with existing multi-modal processing in _forward_micro_batch
+# 
+# Benefits:
+# - Leverages existing GPU-loaded actor_module instead of loading separate visual model
+# - Avoids GPU memory issues in dataset processing
+# - Supports both individual and batch processing for efficiency
+# - Maintains compatibility with existing multi-modal training pipeline

@@ -272,23 +272,11 @@ class TaskRunner:
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
-        from verl.utils.model import get_hf_auto_model_class, AutoModelForCausalLM, AutoModelForVision2Seq
-        from transformers import AutoConfig
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-        
-        # Load model for image embedding generation
-        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-        auto_model_class = get_hf_auto_model_class(model_config)
-        model = auto_model_class.from_pretrained(
-            local_path,
-            torch_dtype="auto",
-            trust_remote_code=trust_remote_code,
-            device_map="auto"  # Load to GPU automatically for better performance
-        )
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
@@ -303,8 +291,8 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, model, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, model, is_train=False)
+        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -329,7 +317,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, model=None, is_train=True):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
     """Create a dataset.
 
     Arguments:
@@ -337,7 +325,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, model=None,
         data_config: The data config.
         tokenizer (Tokenizer): The tokenizer.
         processor (Processor): The processor.
-        model (Model): The model for image embedding generation.
 
     Returns:
         dataset (Dataset): The dataset.
@@ -373,7 +360,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, model=None,
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
-        model=model,
         config=data_config,
     )
 

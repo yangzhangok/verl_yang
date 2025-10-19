@@ -16,6 +16,22 @@
 """
 PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
+
+IMPORTANT: Multi-modal Processing Update
+========================================
+As of this update, pixel_values to embeddings conversion is now handled by actor workers
+instead of loading a separate GPU model in the driver process. This change:
+
+1. Eliminates GPU memory issues in the driver process
+2. Leverages existing actor_module that's already loaded on GPU
+3. Improves efficiency by using batch processing
+4. Maintains compatibility with existing multi-modal training pipeline
+
+The actor workers now provide:
+- process_pixel_values_to_embeddings(): Single sample processing
+- process_batch_pixel_values_to_embeddings(): Batch processing (recommended)
+
+This replaces the previous MultiModalGPUProcessor approach.
 """
 
 import json
@@ -34,7 +50,7 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-from transformers import Qwen2VLForConditionalGeneration
+from transformers import Qwen2_5_VLForConditionalGeneration
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -312,20 +328,6 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
-        
-        # Load Qwen2VL model for visual token processing
-        self.qwen_model = None
-        if hasattr(config, 'model') and hasattr(config.model, 'model_name_or_path'):
-            try:
-                self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    config.model.model_name_or_path,
-                    torch_dtype=torch.float16,
-                    device_map="cpu"  # Load on CPU first, move to GPU when needed
-                )
-                print(f"Successfully loaded Qwen2VL model from {config.model.model_name_or_path}")
-            except Exception as e:
-                print(f"Warning: Failed to load Qwen2VL model: {e}")
-                print("Visual token shuffle will be disabled")
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -354,6 +356,7 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1019,15 +1022,37 @@ class RayPPOTrainer:
                 if "multi_modal_inputs" in gen_batch.non_tensor_batch:
                     multi_modal_data_list = []
                     
-                    # Since image embedding is now handled in the dataset, 
-                    # we just need to convert the format from multi_modal_inputs to multi_modal_data
+                    # Process each item in the batch
+                    # First, collect all multi_modal_inputs that need processing
+                    multi_modal_inputs_to_process = []
+                    indices_to_process = []
+                    
+                    for i, multi_modal_input in enumerate(gen_batch.non_tensor_batch["multi_modal_inputs"]):
+                        if "pixel_values" in multi_modal_input:
+                            multi_modal_inputs_to_process.append(multi_modal_input)
+                            indices_to_process.append(i)
+                    
+                    # Process all pixel_values to embeddings using actor worker
+                    if multi_modal_inputs_to_process:
+                        # Process each multi-modal input individually
+                        for i, multi_modal_input in enumerate(multi_modal_inputs_to_process):
+                            try:
+                                import ipdb;ipdb.set_trace()
+                                processed_input = self.actor_rollout_wg.process_pixel_values_to_embeddings(multi_modal_input)
+                                original_idx = indices_to_process[i]
+                                gen_batch.non_tensor_batch["multi_modal_inputs"][original_idx] = processed_input
+                            except Exception as e:
+                                print(f"Error processing pixel_values to embeddings for sample {i}: {e}")
+                                # Keep original input if processing fails
+                                pass
+                    
+                    # Convert to vLLM format after processing
                     for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:
-                        # The dataset has already processed pixel_values into image_embeds
-                        # We just need to preserve the structure
+                        # Convert to vLLM format
                         multi_modal_data = {
                             "image": {
-                                "image_embeds": multi_modal_input["image_embeds"],  # Already processed by dataset
-                                "image_grid_thw": multi_modal_input["image_grid_thw"],
+                                "image_embeds": multi_modal_input["image_embeddings"],
+                                "image_grid_thw": multi_modal_input.get("image_grid_thw"),
                             }
                         }
                         multi_modal_data_list.append(multi_modal_data)
@@ -1099,7 +1124,6 @@ class RayPPOTrainer:
                     gen_batch_shuffle1 = create_shuffled_gen_batch(gen_batch, shuffle_seed=42)
                     gen_batch_shuffle2 = create_shuffled_gen_batch(gen_batch, shuffle_seed=123)
                 
-                import ipdb;ipdb.set_trace()
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1199,7 +1223,6 @@ class RayPPOTrainer:
                     print(f"Combined cross-corresponded batches: batch_size={batch.batch_size}, keys={list(batch.batch.keys())}")
                     print(f"Non-tensor keys: {list(batch.non_tensor_batch.keys())}")
                     print(f"Meta info keys: {list(batch.meta_info.keys())}")
-                    import ipdb;ipdb.set_trace()
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

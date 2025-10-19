@@ -1104,6 +1104,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
 
+    # ============================ Multi-modal Processing ============================
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def process_pixel_values_to_embeddings(self, multi_modal_inputs: dict) -> dict:
+        """
+        Process pixel_values to embeddings for a single multi-modal input.
+        This is a wrapper function that delegates to the actor's implementation.
+        
+        Args:
+            multi_modal_inputs: Dictionary containing pixel_values and other multi-modal data
+            
+        Returns:
+            Dictionary with processed embeddings and other data
+        """
+        assert self._is_actor
+        
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        
+        # Delegate to the actor's implementation
+        return self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
+
 
 class CriticWorker(Worker, DistProfilerExtension):
     def __init__(self, config: FSDPCriticConfig):
