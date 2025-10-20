@@ -1001,7 +1001,6 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                            import ipdb; ipdb.set_trace()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
 
