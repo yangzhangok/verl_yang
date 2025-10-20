@@ -3,7 +3,8 @@ _target_: verl.workers.config.FSDPEngineConfig
 
 # policy for wrapping the model
 wrap_policy:
-
+  transformer_layer_cls_to_wrap:
+    - Qwen2_5_VisionTransformerPretrainedModel
   # Minimum number of parameters to trigger wrapping a layer with FSDP
   min_num_params: 0
 

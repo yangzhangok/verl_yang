@@ -1064,6 +1064,25 @@ class DataProto:
         output = tu.get_tensordict(tensor_dict=tensor_batch, non_tensor_dict=self.meta_info)
         return output
 
+    def to_dict(self) -> dict:
+        """Convert this DataProto to a dictionary containing both tensor and non-tensor data.
+        
+        Returns:
+            dict: Dictionary containing all data from batch and non_tensor_batch
+        """
+        result = {}
+        
+        # Add tensor data from batch
+        if self.batch is not None:
+            tensor_dict = self.batch.to_dict()
+            result.update(tensor_dict)
+        
+        # Add non-tensor data from non_tensor_batch
+        if self.non_tensor_batch is not None:
+            result.update(self.non_tensor_batch)
+        
+        return result
+
     def get_data_info(self) -> str:
         """Return formatted information about stored data with nested type details.
 

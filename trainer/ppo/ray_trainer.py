@@ -432,6 +432,32 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
+    def _create_dataproto_from_dict(self, data_dict):
+        """
+        Create a DataProto from a dictionary with mixed tensor shapes.
+        This handles cases where tensors have different batch dimensions.
+        Converts all values to numpy arrays for non_tensor_batch compatibility.
+        """
+        from verl.protocol import DataProto
+        
+        # Convert all values to numpy arrays for non_tensor_batch
+        converted_dict = {}
+        for key, val in data_dict.items():
+            if isinstance(val, torch.Tensor):
+                # Convert torch tensor to numpy array
+                converted_dict[key] = val.detach().cpu().numpy()
+            elif isinstance(val, np.ndarray):
+                converted_dict[key] = val
+            else:
+                # Convert other types to numpy array with dtype=object
+                converted_dict[key] = np.array(val, dtype=object)
+        
+        non_tensor_batch = {}
+        non_tensor_batch["multi_modal_data"]=[]
+        non_tensor_batch["multi_modal_data"].append(converted_dict)
+        # Put converted data_dict into non_tensor_batch
+        return DataProto(batch=None, non_tensor_batch=non_tensor_batch, meta_info={})
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -1022,29 +1048,28 @@ class RayPPOTrainer:
                 if "multi_modal_inputs" in gen_batch.non_tensor_batch:
                     multi_modal_data_list = []
                     
-                    # Process each item in the batch
-                    # First, collect all multi_modal_inputs that need processing
-                    multi_modal_inputs_to_process = []
-                    indices_to_process = []
-                    
-                    for i, multi_modal_input in enumerate(gen_batch.non_tensor_batch["multi_modal_inputs"]):
-                        if "pixel_values" in multi_modal_input:
-                            multi_modal_inputs_to_process.append(multi_modal_input)
-                            indices_to_process.append(i)
-                    
-                    # Process all pixel_values to embeddings using actor worker
-                    if multi_modal_inputs_to_process:
-                        # Process each multi-modal input individually
-                        for i, multi_modal_input in enumerate(multi_modal_inputs_to_process):
-                            try:
-                                import ipdb;ipdb.set_trace()
-                                processed_input = self.actor_rollout_wg.process_pixel_values_to_embeddings(multi_modal_input)
-                                original_idx = indices_to_process[i]
-                                gen_batch.non_tensor_batch["multi_modal_inputs"][original_idx] = processed_input
-                            except Exception as e:
-                                print(f"Error processing pixel_values to embeddings for sample {i}: {e}")
-                                # Keep original input if processing fails
-                                pass
+                    # Process all multi_modal_inputs to embeddings using actor worker
+                    if gen_batch.non_tensor_batch["multi_modal_inputs"] is not None:
+                        try:
+                            # Create DataProto for batch processing - directly use the entire gen_batch
+                            multi_modal_data_proto = DataProto.from_dict(
+                                tensors={},  # No tensor data needed for this operation
+                                non_tensors={"multi_modal_inputs": gen_batch.non_tensor_batch["multi_modal_inputs"]},
+                                meta_info={}
+                            )
+                            
+                            # Process the entire batch at once
+                            processed_data_proto = self.actor_rollout_wg.process_pixel_values_to_embeddings(multi_modal_data_proto)
+                            
+                            # Update the original gen_batch with processed results
+                            gen_batch.non_tensor_batch["multi_modal_inputs"] = processed_data_proto.non_tensor_batch["multi_modal_inputs"]
+                                
+                        except Exception as e:
+                            import traceback
+                            print(f"Error processing pixel_values to embeddings for batch: {e}")
+                            print(f"Full traceback: {traceback.format_exc()}")
+                            # Keep original inputs if processing fails
+                            pass
                     
                     # Convert to vLLM format after processing
                     for multi_modal_input in gen_batch.non_tensor_batch["multi_modal_inputs"]:

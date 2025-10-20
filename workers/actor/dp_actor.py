@@ -19,11 +19,12 @@ Single Process Actor
 
 import logging
 import os
-
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
+from copy import deepcopy
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -94,7 +95,7 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"Visual module type: {type(self.actor_module.visual)}")
             print(f"Visual module is FSDP wrapped: {hasattr(self.actor_module.visual, '_fsdp_wrapped_module')}")
 
-    def process_pixel_values_to_embeddings(self, multi_modal_inputs: dict) -> dict:
+    def process_pixel_values_to_embeddings(self, data: DataProto) -> DataProto:
         """
         Process pixel_values to image embeddings using the actor module's visual encoder.
         
@@ -103,11 +104,49 @@ class DataParallelPPOActor(BasePPOActor):
         and leverages the existing actor_module for processing.
         
         Args:
-            multi_modal_inputs (dict): Dictionary containing multi-modal inputs with pixel_values
+            data (DataProto): DataProto containing multi_modal_inputs with pixel_values
             
         Returns:
-            dict: Updated multi_modal_inputs with image_embeddings instead of pixel_values
+            DataProto: Updated DataProto with image_embeddings instead of pixel_values
         """
+        # Extract multi_modal_inputs from non_tensor_batch
+        if "multi_modal_inputs" not in data.non_tensor_batch:
+            return data
+            
+        multi_modal_inputs_list = data.non_tensor_batch["multi_modal_inputs"]
+        
+        # Process each multi_modal_input in the batch
+        processed_inputs = []
+        for multi_modal_input in multi_modal_inputs_list:
+            # Convert numpy arrays back to torch tensors
+            converted_dict = {}
+            for key, val in multi_modal_input.items():
+                if isinstance(val, np.ndarray):
+                    # Convert numpy array back to torch tensor
+                    converted_dict[key] = torch.from_numpy(val)
+                else:
+                    converted_dict[key] = val
+            
+            processed_input = self._process_single_multi_modal_input(converted_dict)
+            processed_inputs.append(processed_input)
+        
+        # Update the data with processed inputs
+        updated_data = deepcopy(data)
+        updated_data.non_tensor_batch["multi_modal_inputs"] = processed_inputs
+        
+        return updated_data
+    
+    def _process_single_multi_modal_input(self, multi_modal_inputs: dict) -> dict:
+        """
+        Process a single multi-modal input to convert pixel_values to embeddings.
+        
+        Args:
+            multi_modal_inputs (dict): Single multi-modal input dictionary
+            
+        Returns:
+            dict: Updated multi-modal input with image_embeddings
+        """
+
         if "pixel_values" not in multi_modal_inputs:
             return multi_modal_inputs
         
@@ -139,8 +178,8 @@ class DataParallelPPOActor(BasePPOActor):
                     pixel_values = pixel_values.type(self.actor_module.visual.dtype)
                     print(f"DEBUG: After dtype conversion - pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
                     
-                    # FSDP 会自动处理权重聚合，无需手动干预
                     if image_grid_thw is not None:
+                        #image_grid_thw = image_grid_thw.unsqueeze(0)
                         image_embeddings = self.actor_module.visual(pixel_values, grid_thw=image_grid_thw)
                     else:
                         image_embeddings = self.actor_module.visual(pixel_values)
@@ -175,7 +214,7 @@ class DataParallelPPOActor(BasePPOActor):
                 
                 # Remove pixel_values and image_grid_thw to save memory
                 updated_inputs.pop("pixel_values", None)
-                updated_inputs.pop("image_grid_thw", None)
+                #updated_inputs.pop("image_grid_thw", None)
                 
                 return updated_inputs
                 
@@ -491,7 +530,7 @@ class DataParallelPPOActor(BasePPOActor):
         # set to eval
         self.actor_module.eval()
 
-        #import ipdb;ipdb.set_trace()
+        import ipdb;ipdb.set_trace()
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]

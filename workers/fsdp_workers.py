@@ -471,7 +471,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
+        
         if fsdp_strategy == "fsdp":
+
+            # actor_module.visual = FSDP(
+            #     actor_module.visual,
+            #     param_init_fn=init_fn,
+            #     sharding_strategy=sharding_strategy,
+            #     mixed_precision=mixed_precision,
+            #     device_id=get_device_id(),
+            #     device_mesh=self.device_mesh,
+            #     use_orig_params=True,                   # ✅ 强烈建议 True
+            #     cpu_offload=cpu_offload,
+            #     forward_prefetch=fsdp_config.get("forward_prefetch", False),
+            # )
+
             actor_module_fsdp = FSDP(
                 actor_module,
                 cpu_offload=cpu_offload,
@@ -480,7 +494,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=self.use_orig_params,
                 device_mesh=self.device_mesh,
                 use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
@@ -1106,25 +1120,49 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     # ============================ Multi-modal Processing ============================
     
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def process_pixel_values_to_embeddings(self, multi_modal_inputs: dict) -> dict:
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def process_pixel_values_to_embeddings(self, multi_modal_inputs: DataProto) -> DataProto:
         """
         Process pixel_values to embeddings for a single multi-modal input.
         This is a wrapper function that delegates to the actor's implementation.
         
         Args:
-            multi_modal_inputs: Dictionary containing pixel_values and other multi-modal data
+            multi_modal_inputs: DataProto containing pixel_values and other multi-modal data
             
         Returns:
-            Dictionary with processed embeddings and other data
+            DataProto with processed embeddings and other data
         """
-        assert self._is_actor
+        
+        # Debug information
+        print(f"DEBUG: self._is_actor = {self._is_actor}")
+        print(f"DEBUG: self.role = {self.role}")
+        print(f"DEBUG: hasattr(self, 'actor') = {hasattr(self, 'actor')}")
+        if hasattr(self, 'actor'):
+            print(f"DEBUG: self.actor is None = {self.actor is None}")
+        
+        if not self._is_actor:
+            raise RuntimeError(f"Worker role '{self.role}' is not an actor. Expected actor, actor_rollout, or actor_rollout_ref")
+        
+        if not hasattr(self, 'actor') or self.actor is None:
+            raise RuntimeError("Actor is not initialized or is None")
         
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         
-        # Delegate to the actor's implementation
-        return self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
+        import ipdb; ipdb.set_trace()
+        processed_dict = self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
+        
+        # Move to CPU to save GPU memory
+        processed_dict = processed_dict.to("cpu")
+        
+        # Unshard FSDP module if needed
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        
+        return processed_dict
 
 
 class CriticWorker(Worker, DistProfilerExtension):
