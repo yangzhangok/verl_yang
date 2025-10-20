@@ -557,6 +557,20 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _get_gen_batch_with_reward(self, batch: DataProto) -> DataProto:
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys())
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -1031,7 +1045,7 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                gen_batch = self._get_gen_batch_with_reward(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -1076,13 +1090,12 @@ class RayPPOTrainer:
                         # Convert to vLLM format
                         multi_modal_data = {
                             "image": {
-                                "image_embeds": multi_modal_input["image_embeddings"],
+                                "image_embeds": multi_modal_input["image_embeddings"].to(torch.float32),
                                 "image_grid_thw": multi_modal_input.get("image_grid_thw"),
                             }
                         }
                         multi_modal_data_list.append(multi_modal_data)
                     
-                    import ipdb; ipdb.set_trace()
                     # Replace multi_modal_inputs with multi_modal_data
                     gen_batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
                     del gen_batch.non_tensor_batch["multi_modal_inputs"]
@@ -1171,18 +1184,11 @@ class RayPPOTrainer:
                         else:
                             gen_batch_output2 = self.async_rollout_manager.generate_sequences(gen_batch_shuffle2_repeated)
                         
-                        # Create cross-correspondence: shuffle1 batch with shuffle2 output, and vice versa
-                        # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
-                        gen_batch_output_cross1 = gen_batch_output2  # shuffle1 batch with shuffle2 output
-                        gen_batch_output_cross2 = gen_batch_output1  # shuffle2 batch with shuffle1 output
-                        
-                        # Combine the cross-corresponded outputs
-                        gen_batch_output = gen_batch_output_cross1.union(gen_batch_output_cross2)
+                        # Combine the cross-corresponded outputs (remove debug breakpoint)
                         
                         # Update timing info
                         timing_raw.update(gen_batch_output1.meta_info["timing"])
                         timing_raw.update(gen_batch_output2.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
                         
                         print(f"Cross-correspondence: shuffle1 batch with shuffle2 output, shuffle2 batch with shuffle1 output")
                         print(f"Generated {n_samples_per_shuffle} samples from each shuffle with cross-correspondence")
@@ -1207,18 +1213,31 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout with cross-correspondence
-                    # Create cross-corresponded batch: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
-                    batch_shuffle1 = gen_batch_shuffle1.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
-                    batch_shuffle2 = gen_batch_shuffle2.repeat(repeat_times=n_samples_per_shuffle, interleave=True)
                     
                     # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
-                    batch_cross1 = batch_shuffle1.union(gen_batch_output2)  # shuffle1 batch with shuffle2 output
-                    batch_cross2 = batch_shuffle2.union(gen_batch_output1)  # shuffle2 batch with shuffle1 output
+                    # Define keys to preserve from reward model and keys to pop to avoid conflicts
+                    reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & gen_batch_shuffle1_repeated.non_tensor_batch.keys()
                     
-                    # Combine the cross-corresponded batches
-                    # Handle potential conflicts in meta_info and non_tensor_batch
-                    batch = batch_cross1.union(batch_cross2)
+                    # Pop conflicting keys from batch_shuffle before union
+                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                    non_tensor_batch_keys_to_pop = set(gen_batch_shuffle1_repeated.non_tensor_batch.keys()) - reward_model_keys
+                    
+                    # Create clean batches for union (pop conflicting keys)
+                    batch_shuffle1_clear = gen_batch_shuffle1_repeated.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+                    )
+                    batch_shuffle2_clear = gen_batch_shuffle2_repeated.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+                    )
+                    
+                    # Now union without conflicts
+                    batch_cross1 = gen_batch_shuffle1_repeated.union(gen_batch_output2)
+                    batch_cross2 = gen_batch_shuffle2_repeated.union(gen_batch_output1)
+                    
+                    # Combine the cross-corresponded batches by concatenation along batch dimension
+                    batch = DataProto.concat([batch_cross1, batch_cross2])
                     
                     # Ensure all necessary attributes are preserved
                     # Check if any critical attributes are missing and handle them
@@ -1246,7 +1265,6 @@ class RayPPOTrainer:
                             elif "raw_prompt_ids" in batch_cross2.non_tensor_batch:
                                 batch.non_tensor_batch["raw_prompt_ids"] = batch_cross2.non_tensor_batch["raw_prompt_ids"]
                     
-                    print(f"Combined cross-corresponded batches: batch_size={batch.batch_size}, keys={list(batch.batch.keys())}")
                     print(f"Non-tensor keys: {list(batch.non_tensor_batch.keys())}")
                     print(f"Meta info keys: {list(batch.meta_info.keys())}")
 

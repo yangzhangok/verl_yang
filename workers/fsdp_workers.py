@@ -1152,7 +1152,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         processed_dict = self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
         
         # Move to CPU to save GPU memory
-        processed_dict = processed_dict.to("cpu")
+        # 手动递归移动到 CPU
+        def recursive_to_cpu(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu()  # 或 .to('cpu')
+            elif isinstance(obj, dict):
+                return {k: recursive_to_cpu(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [recursive_to_cpu(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return tuple(recursive_to_cpu(item) for item in obj)
+            else:
+                return obj
+
+        processed_dict.batch = recursive_to_cpu(processed_dict.batch)
+        processed_dict.non_tensor_batch = recursive_to_cpu(processed_dict.non_tensor_batch)
         
         # Unshard FSDP module if needed
         if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
