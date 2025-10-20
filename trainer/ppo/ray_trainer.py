@@ -1082,6 +1082,7 @@ class RayPPOTrainer:
                         }
                         multi_modal_data_list.append(multi_modal_data)
                     
+                    import ipdb; ipdb.set_trace()
                     # Replace multi_modal_inputs with multi_modal_data
                     gen_batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
                     del gen_batch.non_tensor_batch["multi_modal_inputs"]

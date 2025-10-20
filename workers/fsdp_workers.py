@@ -1149,7 +1149,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         
-        import ipdb; ipdb.set_trace()
         processed_dict = self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
         
         # Move to CPU to save GPU memory
