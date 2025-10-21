@@ -871,33 +871,55 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    if on_policy:
-                        old_log_prob = log_prob.detach()
+                    # Check if we're in cross-entropy training mode
+                    cross_entropy_training = data.meta_info.get("cross_entropy_training", False)
+                    
+                    if cross_entropy_training:
+                        # Direct cross-entropy loss training (skip PPO loss)
+                        print("Using cross-entropy loss for training")
+                        # Cross-entropy loss is simply -log_prob
+                        policy_loss = -agg_loss(loss_mat=log_prob, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        
+                        # Add entropy regularization if specified
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = policy_loss - entropy_loss * entropy_coeff
+                        
+                        # Set dummy metrics for compatibility
+                        micro_batch_metrics["actor/pg_loss"] = policy_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/pg_clipfrac"] = 0.0
+                        micro_batch_metrics["actor/ppo_kl"] = 0.0
+                        micro_batch_metrics["actor/pg_clipfrac_lower"] = 0.0
+                        
                     else:
-                        old_log_prob = model_inputs["old_log_probs"]
+                        # Original PPO training logic
+                        if on_policy:
+                            old_log_prob = log_prob.detach()
+                        else:
+                            old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_log_probs=rollout_log_probs,
-                    )
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
