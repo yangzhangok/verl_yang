@@ -77,6 +77,199 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def compute_data_metrics_safe(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+    """
+    Safe version of compute_data_metrics that handles missing keys gracefully.
+    
+    This function is designed to work with both PPO training and cross-entropy training modes,
+    where some keys might be missing in the batch.
+    
+    Args:
+        batch: A DataProto object containing batch data
+        use_critic: Whether to include critic-specific metrics. Defaults to True.
+        
+    Returns:
+        A dictionary of metrics, with missing keys handled gracefully.
+    """
+    # Check if we're in cross-entropy training mode
+    cross_entropy_training = batch.meta_info.get("cross_entropy_training", False)
+    
+    # Initialize metrics dictionary
+    metrics = {}
+    
+    # Basic response info (always available)
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"]
+    response_length = response_info["response_length"]
+    response_mask = response_info["response_mask"]
+    
+    # Response length statistics (always available)
+    max_response_length = batch.batch["responses"].shape[-1]
+    max_prompt_length = response_info["prompt_length"].max().item()
+    
+    aborted_mask = (response_length == 0).bool()
+    non_aborted_mask = ~aborted_mask
+    
+    # Response length metrics
+    metrics.update({
+        "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/max": torch.max(response_length).detach().item(),
+        "response_length/min": torch.min(response_length).detach().item(),
+        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+    })
+    
+    # Non-aborted response length metrics
+    non_aborted_response_length = response_length[non_aborted_mask]
+    if non_aborted_response_length.numel() > 0:
+        metrics.update({
+            "response_length_non_aborted/mean": torch.mean(non_aborted_response_length).detach().item(),
+            "response_length_non_aborted/max": torch.max(non_aborted_response_length).detach().item(),
+            "response_length_non_aborted/min": torch.min(non_aborted_response_length).detach().item(),
+            "response_length_non_aborted/clip_ratio": torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item(),
+        })
+    else:
+        # Handle case where all samples are aborted
+        metrics.update({
+            "response_length_non_aborted/mean": 0.0,
+            "response_length_non_aborted/max": 0.0,
+            "response_length_non_aborted/min": 0.0,
+            "response_length_non_aborted/clip_ratio": 0.0,
+        })
+    
+    # Aborted ratio
+    aborted_ratio = torch.mean(aborted_mask.float()).detach().item()
+    metrics["response/aborted_ratio"] = aborted_ratio
+    
+    # Prompt length metrics
+    metrics.update({
+        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+        "prompt_length/max": torch.max(prompt_length).detach().item(),
+        "prompt_length/min": torch.min(prompt_length).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+    })
+    
+    # Handle PPO-specific metrics only if not in cross-entropy training mode
+    if not cross_entropy_training:
+        # Check for required keys and compute metrics if available
+        if "token_level_scores" in batch.batch:
+            sequence_score = batch.batch["token_level_scores"].sum(-1)
+            non_aborted_sequence_score = sequence_score[non_aborted_mask]
+            
+            if non_aborted_sequence_score.numel() > 0:
+                metrics.update({
+                    "critic/score/mean": torch.mean(non_aborted_sequence_score).detach().item(),
+                    "critic/score/max": torch.max(non_aborted_sequence_score).detach().item(),
+                    "critic/score/min": torch.min(non_aborted_sequence_score).detach().item(),
+                })
+            else:
+                metrics.update({
+                    "critic/score/mean": 0.0,
+                    "critic/score/max": 0.0,
+                    "critic/score/min": 0.0,
+                })
+        
+        if "token_level_rewards" in batch.batch:
+            sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+            non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
+            
+            if non_aborted_sequence_reward.numel() > 0:
+                metrics.update({
+                    "critic/rewards/mean": torch.mean(non_aborted_sequence_reward).detach().item(),
+                    "critic/rewards/max": torch.max(non_aborted_sequence_reward).detach().item(),
+                    "critic/rewards/min": torch.min(non_aborted_sequence_reward).detach().item(),
+                })
+            else:
+                metrics.update({
+                    "critic/rewards/mean": 0.0,
+                    "critic/rewards/max": 0.0,
+                    "critic/rewards/min": 0.0,
+                })
+        
+        if "advantages" in batch.batch:
+            advantages = batch.batch["advantages"]
+            valid_adv = torch.masked_select(advantages, response_mask)
+            
+            if valid_adv.numel() > 0:
+                metrics.update({
+                    "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
+                    "critic/advantages/max": torch.max(valid_adv).detach().item(),
+                    "critic/advantages/min": torch.min(valid_adv).detach().item(),
+                })
+            else:
+                metrics.update({
+                    "critic/advantages/mean": 0.0,
+                    "critic/advantages/max": 0.0,
+                    "critic/advantages/min": 0.0,
+                })
+        
+        if "returns" in batch.batch:
+            returns = batch.batch["returns"]
+            valid_returns = torch.masked_select(returns, response_mask)
+            
+            if valid_returns.numel() > 0:
+                metrics.update({
+                    "critic/returns/mean": torch.mean(valid_returns).detach().item(),
+                    "critic/returns/max": torch.max(valid_returns).detach().item(),
+                    "critic/returns/min": torch.min(valid_returns).detach().item(),
+                })
+            else:
+                metrics.update({
+                    "critic/returns/mean": 0.0,
+                    "critic/returns/max": 0.0,
+                    "critic/returns/min": 0.0,
+                })
+        
+        # Critic-specific metrics
+        if use_critic and "values" in batch.batch:
+            values = batch.batch["values"]
+            valid_values = torch.masked_select(values, response_mask)
+            
+            if valid_values.numel() > 0:
+                metrics.update({
+                    "critic/values/mean": torch.mean(valid_values).detach().item(),
+                    "critic/values/max": torch.max(valid_values).detach().item(),
+                    "critic/values/min": torch.min(valid_values).detach().item(),
+                })
+                
+                # VF explained variance
+                if "returns" in batch.batch:
+                    valid_returns = torch.masked_select(returns, response_mask)
+                    if valid_returns.numel() > 0:
+                        return_diff_var = torch.var(valid_returns - valid_values)
+                        return_var = torch.var(valid_returns)
+                        vf_explained_var = (1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
+                        metrics["critic/vf_explained_var"] = vf_explained_var
+                    else:
+                        metrics["critic/vf_explained_var"] = 0.0
+            else:
+                metrics.update({
+                    "critic/values/mean": 0.0,
+                    "critic/values/max": 0.0,
+                    "critic/values/min": 0.0,
+                    "critic/vf_explained_var": 0.0,
+                })
+    
+    # Multi-turn conversation metrics
+    if "__num_turns__" in batch.non_tensor_batch:
+        num_turns = batch.non_tensor_batch["__num_turns__"]
+        metrics.update({
+            "num_turns/min": num_turns.min(),
+            "num_turns/max": num_turns.max(),
+            "num_turns/mean": num_turns.mean(),
+        })
+    
+    # Tool call counts
+    if "tool_call_counts" in batch.non_tensor_batch:
+        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
+        metrics.update({
+            "tool_call_counts/min": tool_call_counts.min(),
+            "tool_call_counts/max": tool_call_counts.max(),
+            "tool_call_counts/mean": tool_call_counts.mean(),
+        })
+    
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.

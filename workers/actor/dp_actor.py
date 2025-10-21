@@ -369,6 +369,14 @@ class DataParallelPPOActor(BasePPOActor):
             from verl.utils.model import extract_multi_modal_inputs
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
+            
+            # Optimize multi-modal processing with better memory management
+            if multi_modal_inputs is not None and "pixel_values" in multi_modal_inputs:
+                # Process images in batches for better GPU utilization
+                pixel_values = multi_modal_inputs["pixel_values"]
+                if pixel_values.dim() == 4:  # (batch_size, channels, height, width)
+                    # Ensure pixel values are contiguous for better performance
+                    multi_modal_inputs["pixel_values"] = pixel_values.contiguous()
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -376,6 +384,10 @@ class DataParallelPPOActor(BasePPOActor):
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             entropy = None
+            
+            # Pre-allocate tensors for better memory efficiency
+            if calculate_entropy:
+                entropy = torch.zeros(batch_size, seqlen, device=input_ids.device, dtype=torch.bfloat16)
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -867,9 +879,22 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+                    
+                    # Use torch.cuda.synchronize() for better GPU utilization tracking
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # Memory optimization: clear cache before forward pass
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    
+                    # Memory optimization: clear cache after forward pass
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                     # Check if we're in cross-entropy training mode
                     cross_entropy_training = data.meta_info.get("cross_entropy_training", False)
@@ -940,14 +965,16 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
 
-                    micro_batch_metrics.update(
-                        {
-                            "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        }
-                    )
+                    # Only update PPO metrics if not in cross_entropy_training mode
+                    if not cross_entropy_training:
+                        micro_batch_metrics.update(
+                            {
+                                "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            }
+                        )
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
