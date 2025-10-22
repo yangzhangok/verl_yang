@@ -970,6 +970,8 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        #model_cfg = getattr(self.actor_rollout_wg.actor.actor_module, "config", getattr(getattr(self.actor_rollout_wg.actor.actor_module, "model", None), "config", None))
+        image_token_id = 151655 #getattr(model_cfg, "image_token_id", None)
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1026,10 +1028,99 @@ class RayPPOTrainer:
 
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                            del gen_baseline_batch, gen_baseline_output  
+                    
+                # Convert multi_modal_inputs to multi_modal_data format for vLLM
+                if "multi_modal_inputs" in batch.non_tensor_batch:
+                    multi_modal_data_list = []
+                    
+                    # Process all multi_modal_inputs to embeddings using actor worker
+                    if batch.non_tensor_batch["multi_modal_inputs"] is not None:
+                        try:
+                            # Create DataProto for batch processing - directly use the entire gen_batch
+                            multi_modal_data_proto = DataProto.from_dict(
+                                tensors={},  # No tensor data needed for this operation
+                                non_tensors={"multi_modal_inputs": batch.non_tensor_batch["multi_modal_inputs"]},
+                                meta_info={}
+                            )
+                            
+                            # Process the entire batch at once
+                            processed_data_proto = self.actor_rollout_wg.process_pixel_values_to_embeddings(multi_modal_data_proto)
+                            
+                            # Update the original gen_batch with processed results
+                            batch.non_tensor_batch["multi_modal_inputs"] = processed_data_proto.non_tensor_batch["multi_modal_inputs"]
+                                
+                        except Exception as e:
+                            import traceback
+                            print(f"Error processing pixel_values to embeddings for batch: {e}")
+                            print(f"Full traceback: {traceback.format_exc()}")
+                            # Keep original inputs if processing fails
+                            pass
+                    
+                    # Convert to vLLM format after processing
+                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                        # Convert to vLLM format
+                        multi_modal_data = {
+                            "image": {
+                                "image_embeds": multi_modal_input["image_embeddings"].to(torch.float32),
+                            }
+                        }
+                        multi_modal_data_list.append(multi_modal_data)
+                    
+                    # Replace multi_modal_inputs with multi_modal_data
+                    batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
+                    del batch.non_tensor_batch["multi_modal_inputs"]
+
+
+                    # Create two different shuffle versions
+                    def create_drop_gen_batch(base_gen_batch, drop_seed, drop_ratio=0.3):
+                        """Create a version of gen_batch with randomly dropped image tokens via attention_mask"""
+                        drop_gen_batch = deepcopy(base_gen_batch)
+                        
+                        if "multi_modal_data" in drop_gen_batch.non_tensor_batch:
+                            # Set random seed for reproducible dropping
+                            torch.manual_seed(drop_seed)
+                            
+                            input_ids = drop_gen_batch.batch["input_ids"]  # Shape: (batch_size, seq_len)
+                            attention_mask = drop_gen_batch.batch["attention_mask"]  # Shape: (batch_size, seq_len)
+                            multi_modal_data_list = drop_gen_batch.non_tensor_batch["multi_modal_data"]
+                            
+                            batch_size = input_ids.shape[0]
+                            
+                            # Process each sample in the batch
+                            for batch_idx in range(batch_size):
+                                # Find positions where input_ids == image_token_id (image token)
+                                image_token_mask = input_ids[batch_idx] == image_token_id
+                                image_token_positions = torch.where(image_token_mask)[0]
+                                
+                                if len(image_token_positions) > 0:
+                                    num_image_tokens = len(image_token_positions)
+                                    
+                                    # Randomly select image tokens to drop
+                                    num_to_drop = int(num_image_tokens * drop_ratio)
+                                    if num_to_drop > 0:
+                                        drop_indices = torch.randperm(num_image_tokens)[:num_to_drop]
+                                        dropped_positions = image_token_positions[drop_indices]
+                                        
+                                        # Set attention_mask to 0 for dropped image token positions
+                                        attention_mask[batch_idx, dropped_positions] = 0
+                                        
+                                        print(f"drop {drop_seed}, batch {batch_idx}: dropped {num_to_drop}/{num_image_tokens} image tokens")
+                            
+                            # Remove image_grid_thw as requested
+                            for batch_idx in range(batch_size):
+                                if "image" in multi_modal_data_list[batch_idx]:
+                                    image_data = multi_modal_data_list[batch_idx]["image"]
+                                    if "image_grid_thw" in image_data:
+                                        del multi_modal_data_list[batch_idx]["image"]["image_grid_thw"]
+                        
+                        return drop_gen_batch
+
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    batch = create_drop_gen_batch(batch, 123, drop_ratio=0.3)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)

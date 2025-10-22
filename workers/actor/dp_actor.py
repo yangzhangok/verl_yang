@@ -20,6 +20,8 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
+from copy import deepcopy
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -83,6 +85,135 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+
+    def process_pixel_values_to_embeddings(self, data: DataProto) -> DataProto:
+        """
+        Process pixel_values to image embeddings using the actor module's visual encoder.
+        
+        This function converts pixel_values to image embeddings using the model's visual component,
+        which is already loaded on GPU. This avoids the need to load a separate visual model
+        and leverages the existing actor_module for processing.
+        
+        Args:
+            data (DataProto): DataProto containing multi_modal_inputs with pixel_values
+            
+        Returns:
+            DataProto: Updated DataProto with image_embeddings instead of pixel_values
+        """
+        # Extract multi_modal_inputs from non_tensor_batch
+        if "multi_modal_inputs" not in data.non_tensor_batch:
+            return data
+            
+        multi_modal_inputs_list = data.non_tensor_batch["multi_modal_inputs"]
+        
+        # Process each multi_modal_input in the batch
+        processed_inputs = []
+        for multi_modal_input in multi_modal_inputs_list:
+            # Convert numpy arrays back to torch tensors
+            converted_dict = {}
+            for key, val in multi_modal_input.items():
+                if isinstance(val, np.ndarray):
+                    # Convert numpy array back to torch tensor
+                    converted_dict[key] = torch.from_numpy(val)
+                else:
+                    converted_dict[key] = val
+            
+            processed_input = self._process_single_multi_modal_input(converted_dict)
+            processed_inputs.append(processed_input)
+        
+        # Update the data with processed inputs
+        updated_data = deepcopy(data)
+        updated_data.non_tensor_batch["multi_modal_inputs"] = processed_inputs
+        
+        return updated_data
+    
+    def _process_single_multi_modal_input(self, multi_modal_inputs: dict) -> dict:
+        """
+        Process a single multi-modal input to convert pixel_values to embeddings.
+        
+        Args:
+            multi_modal_inputs (dict): Single multi-modal input dictionary
+            
+        Returns:
+            dict: Updated multi-modal input with image_embeddings
+        """
+
+        if "pixel_values" not in multi_modal_inputs:
+            return multi_modal_inputs
+        
+        pixel_values = multi_modal_inputs["pixel_values"]
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        
+        # Ensure pixel_values is on the correct device
+        if pixel_values.device != self.actor_module.device:
+            pixel_values = pixel_values.to(self.actor_module.device)
+        
+        if image_grid_thw is not None and image_grid_thw.device != self.actor_module.device:
+            image_grid_thw = image_grid_thw.to(self.actor_module.device)
+        
+        # Set model to eval mode for inference
+        was_training = self.actor_module.training
+        self.actor_module.eval()
+        
+        try:
+            with torch.no_grad():
+                # Debug: Print pixel_values shape and dtype
+                print(f"DEBUG: pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                if image_grid_thw is not None:
+                    print(f"DEBUG: image_grid_thw shape: {image_grid_thw.shape}, dtype: {image_grid_thw.dtype}")
+                
+                # Use the model's visual encoder to process pixel_values
+                if hasattr(self.actor_module, 'visual'):
+                    # Direct access to visual encoder (FSDP wrapped)
+                    # Convert pixel_values to the correct dtype for visual encoder
+                    pixel_values = pixel_values.type(self.actor_module.visual.dtype)
+                    print(f"DEBUG: After dtype conversion - pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+                    
+                    if image_grid_thw is not None:
+                        #image_grid_thw = image_grid_thw.unsqueeze(0)
+                        image_embeddings = self.actor_module.visual(pixel_values, grid_thw=image_grid_thw)
+                    else:
+                        image_embeddings = self.actor_module.visual(pixel_values)
+                elif hasattr(self.actor_module, 'module') and hasattr(self.actor_module.module, 'visual'):
+                    # FSDP wrapped model
+                    # Convert pixel_values to the correct dtype for visual encoder
+                    pixel_values = pixel_values.type(self.actor_module.module.visual.dtype)
+                    
+                    if image_grid_thw is not None:
+                        image_embeddings = self.actor_module.module.visual(pixel_values, grid_thw=image_grid_thw)
+                    else:
+                        image_embeddings = self.actor_module.module.visual(pixel_values)
+                else:
+                    # Try to find visual encoder in model structure
+                    model = getattr(self.actor_module, 'module', self.actor_module)
+                    if hasattr(model, 'model') and hasattr(model.model, 'visual'):
+                        # Convert pixel_values to the correct dtype for visual encoder
+                        pixel_values = pixel_values.type(model.model.visual.dtype)
+                        
+                        if image_grid_thw is not None:
+                            image_embeddings = model.model.visual(pixel_values, grid_thw=image_grid_thw)
+                        else:
+                            image_embeddings = model.model.visual(pixel_values)
+                    else:
+                        raise AttributeError("Could not find visual encoder in actor_module")
+                
+                logger.debug(f"Processed pixel_values shape {pixel_values.shape} to embeddings shape {image_embeddings.shape}")
+                
+                # Update multi_modal_inputs with embeddings
+                updated_inputs = multi_modal_inputs.copy()
+                updated_inputs["image_embeddings"] = image_embeddings
+                
+                # Remove pixel_values and image_grid_thw to save memory
+                updated_inputs.pop("pixel_values", None)
+                #updated_inputs.pop("image_grid_thw", None)
+                
+                return updated_inputs
+                
+        finally:
+            # Restore original training mode
+            if was_training:
+                self.actor_module.train()
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,6 +222,63 @@ class DataParallelPPOActor(BasePPOActor):
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
+        # If only partial multimodal embeds are provided, construct full inputs_embeds from input_ids
+
+        if "inputs_embeds" not in micro_batch and "multi_modal_inputs" in micro_batch:
+            mm = micro_batch["multi_modal_inputs"] or {}
+            has_img = "image_embeddings" in mm and mm["image_embeddings"] is not None
+            has_vid = "video_embeddings" in mm and mm["video_embeddings"] is not None
+            if has_img or has_vid:
+                input_ids = micro_batch["input_ids"]
+                # 1) get token embeddings
+                get_emb_module = None
+                if hasattr(self.actor_module, "get_input_embeddings"):
+                    get_emb_module = self.actor_module.get_input_embeddings()
+                elif hasattr(self.actor_module, "model") and hasattr(self.actor_module.model, "get_input_embeddings"):
+                    get_emb_module = self.actor_module.model.get_input_embeddings()
+                if get_emb_module is None:
+                    raise RuntimeError("Model does not expose get_input_embeddings() to build inputs_embeds")
+                token_embeds = get_emb_module(input_ids)
+
+                # 2) scatter image/video embeddings into placeholder token positions
+                model_cfg = getattr(self.actor_module, "config", getattr(getattr(self.actor_module, "model", None), "config", None))
+                image_token_id = getattr(model_cfg, "image_token_id", None)
+                video_token_id = getattr(model_cfg, "video_token_id", None)
+
+                inputs_embeds = token_embeds
+                if has_img:
+                    if image_token_id is None:
+                        raise RuntimeError("image_token_id not found in model config; cannot place image embeddings")
+                    img_embeds = mm["image_embeddings"].to(inputs_embeds.device, inputs_embeds.dtype)
+                    mask = (input_ids == image_token_id)
+                    num_tokens = int(mask.sum().item())
+                    if img_embeds.dim() == 3:
+                        img_embeds = img_embeds.reshape(-1, img_embeds.size(-1))
+                    if img_embeds.size(0) != num_tokens:
+                        raise ValueError(f"Image features ({img_embeds.size(0)}) do not match image tokens ({num_tokens})")
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, img_embeds)
+
+                if has_vid:
+                    if video_token_id is None:
+                        raise RuntimeError("video_token_id not found in model config; cannot place video embeddings")
+                    vid_embeds = mm["video_embeddings"].to(inputs_embeds.device, inputs_embeds.dtype)
+                    mask = (input_ids == video_token_id)
+                    num_tokens = int(mask.sum().item())
+                    if vid_embeds.dim() == 3:
+                        vid_embeds = vid_embeds.reshape(-1, vid_embeds.size(-1))
+                    if vid_embeds.size(0) != num_tokens:
+                        raise ValueError(f"Video features ({vid_embeds.size(0)}) do not match video tokens ({num_tokens})")
+                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
+                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, vid_embeds)
+
+                micro_batch["inputs_embeds"] = inputs_embeds
+
+        # Dispatch to inputs_embeds path if provided (either precomputed or just constructed above)
+        if "inputs_embeds" in micro_batch:
+            return self._forward_micro_batch_with_input_embeds(
+                micro_batch, temperature=temperature, calculate_entropy=calculate_entropy
+            )
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -167,7 +355,6 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                import ipdb; ipdb.set_trace()
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -268,6 +455,174 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                        else:
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+
+            return entropy, log_probs
+
+    def _forward_micro_batch_with_input_embeds(
+        self, micro_batch, temperature, calculate_entropy=False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward when caller provides precomputed `inputs_embeds`.
+
+        Behavior mirrors the token-id path, including remove-padding and Ulysses SP.
+        Labels are still computed from the token sequence (input_ids rolled by 1).
+        """
+        response_length = micro_batch["responses"].size(-1)
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            inputs_embeds = micro_batch["inputs_embeds"]  # (bsz, seqlen, hidden)
+            input_ids = micro_batch["input_ids"]  # used to derive labels
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+            batch_size, seqlen, hidden_size = inputs_embeds.shape
+            entropy = None
+
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+
+            if self.use_remove_padding:
+                # Derive indices from input_ids rmpad to use consistently for embeds/pos ids
+                input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
+                    input_ids.unsqueeze(-1), attention_mask
+                )
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # Unpad embeds using the same indices
+                embeds_flat = rearrange(inputs_embeds, "b s h -> (b s) h")
+                embeds_rmpad = index_first_axis(embeds_flat, indices).unsqueeze(0)  # (1, total_nnz, hidden)
+
+                # Unpad position ids
+                if position_ids.dim() == 3:
+                    position_ids_rmpad = (
+                        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                        .transpose(0, 1)
+                        .unsqueeze(1)
+                    )
+                else:
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+
+                # Labels from input_ids rmpad (next-token)
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
+
+                # Ulysses SP: pad and slice along seq dim for all rmpad tensors
+                if self.use_ulysses_sp:
+                    # For ids/pos: reuse helper returning a common pad_size
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad, position_ids_rmpad=position_ids_rmpad, sp_size=self.ulysses_sequence_parallel_size
+                    )
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled, position_ids_rmpad=None, sp_size=self.ulysses_sequence_parallel_size
+                    )
+
+                    # For embeds: manually pad along seq and slice to keep the same pad_size
+                    total_len = embeds_rmpad.size(1)
+                    if pad_size > 0:
+                        embeds_rmpad = torch.nn.functional.pad(embeds_rmpad, (0, 0, 0, pad_size))
+                    embeds_rmpad = ulysses_pad_and_slice_inputs.__globals__["slice_input_tensor"](
+                        embeds_rmpad, dim=1, padding=False
+                    )
+
+                else:
+                    pad_size = 0
+
+                # Call model with embeds
+                extra_args = {}
+                if self.use_fused_kernels:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    inputs_embeds=embeds_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                    **extra_args,
+                )
+
+                if self.use_fused_kernels:
+                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                else:
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab)
+                    logits_rmpad.div_(temperature)
+
+                    inplace_backward = not calculate_entropy
+                    log_probs = logprobs_from_logits(
+                        logits=logits_rmpad,
+                        labels=input_ids_rmpad_rolled,
+                        inplace_backward=inplace_backward,
+                    )
+
+                    if calculate_entropy:
+                        if not self.config.entropy_checkpointing:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                        else:
+                            entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+
+                # Gather and unpad across SP
+                if self.use_ulysses_sp:
+                    log_probs = gather_outputs_and_unpad(
+                        log_probs,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+                    if calculate_entropy:
+                        entropy_rmpad = gather_outputs_and_unpad(
+                            entropy_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+
+                # Pad back to (bsz, seqlen)
+                if calculate_entropy:
+                    full_entropy = pad_input(
+                        hidden_states=entropy_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                full_log_probs = pad_input(
+                    hidden_states=log_probs.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+
+                if calculate_entropy:
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+
+            else:
+                # No remove-padding: pass embeds with regular masks
+                extra_args = {}
+                if self.use_fused_kernels:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    **extra_args,
+                )
+
+                if self.use_fused_kernels:
+                    log_probs = output.log_probs[:, -response_length - 1 : -1]
+                    entropy = output.entropy[:, -response_length - 1 : -1]
+                else:
+                    logits = output.logits
+                    logits.div_(temperature)
+                    logits = logits[:, -response_length - 1 : -1, :]
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if calculate_entropy:
+                        if not self.config.entropy_checkpointing:
+                            entropy = verl_F.entropy_from_logits(logits)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
