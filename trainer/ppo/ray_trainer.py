@@ -1034,8 +1034,17 @@ class RayPPOTrainer:
                 if "multi_modal_inputs" in batch.non_tensor_batch:
                     multi_modal_data_list = []
                     
-                    # Process all multi_modal_inputs to embeddings using actor worker
+                    # Check if we're using preprocessed embeddings
+                    use_preprocessed = False
                     if batch.non_tensor_batch["multi_modal_inputs"] is not None:
+                        # Check if any item in the batch uses preprocessed embeddings
+                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                            if isinstance(multi_modal_input, dict) and multi_modal_input.get("use_preprocessed_embeddings", False):
+                                use_preprocessed = True
+                                break
+                    
+                    # Process all multi_modal_inputs to embeddings using actor worker
+                    if batch.non_tensor_batch["multi_modal_inputs"] is not None and not use_preprocessed:
                         try:
                             # Create DataProto for batch processing - directly use the entire gen_batch
                             multi_modal_data_proto = DataProto.from_dict(
@@ -1056,6 +1065,8 @@ class RayPPOTrainer:
                             print(f"Full traceback: {traceback.format_exc()}")
                             # Keep original inputs if processing fails
                             pass
+                    elif use_preprocessed:
+                        print("Using preprocessed embeddings, skipping real-time processing")
                     
                     # Convert to vLLM format after processing
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:

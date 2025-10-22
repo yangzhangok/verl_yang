@@ -117,6 +117,10 @@ class RLHFDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
+        
+        # Support for preprocessed embeddings
+        self.use_preprocessed_embeddings = config.get("use_preprocessed_embeddings", True)
+        self.embedding_key = config.get("embedding_key", "image_embeddings")
 
         self._download()
         self._read_files_and_tokenize()
@@ -269,7 +273,35 @@ class RLHFDataset(Dataset):
             # We will do batch.union() in the trainer,
             # so we cannot have "multi_modal_inputs" in row_dict if rollout generates new multi_modal_inputs
             if self.return_multi_modal_inputs:
-                row_dict["multi_modal_inputs"] = dict(model_inputs)
+                # Check if preprocessed embeddings are available
+                if (self.use_preprocessed_embeddings and 
+                    self.embedding_key in row_dict and 
+                    row_dict[self.embedding_key] is not None):
+                    
+                    # Use preprocessed embeddings
+                    logger.debug(f"Using preprocessed embeddings for item {item}")
+                    multi_modal_inputs = dict(model_inputs)
+                    
+                    # Replace pixel_values with preprocessed embeddings
+                    if "pixel_values" in multi_modal_inputs:
+                        # Convert preprocessed embedding to the expected format
+                        preprocessed_embedding = row_dict[self.embedding_key]
+                        if isinstance(preprocessed_embedding, torch.Tensor):
+                            multi_modal_inputs["pixel_values"] = preprocessed_embedding
+                        else:
+                            # Handle other formats if needed
+                            multi_modal_inputs["pixel_values"] = torch.tensor(preprocessed_embedding)
+                    
+                    row_dict["multi_modal_inputs"] = multi_modal_inputs
+                    
+                    # Mark that we're using preprocessed embeddings
+                    row_dict["multi_modal_inputs"]["use_preprocessed_embeddings"] = True
+                    
+                else:
+                    # Use original processing (fallback)
+                    logger.debug(f"Using original processing for item {item}")
+                    row_dict["multi_modal_inputs"] = dict(model_inputs)
+                    row_dict["multi_modal_inputs"]["use_preprocessed_embeddings"] = False
 
                 # second_per_grid_ts isn't used for training, just for mrope
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
