@@ -1211,6 +1211,24 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
                     
+                    # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
+                    # Define keys to preserve from reward model and keys to pop to avoid conflicts
+                    reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & gen_batch_shuffle1_repeated.non_tensor_batch.keys()
+
+                    # Pop conflicting keys from batch_shuffle before union
+                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                    non_tensor_batch_keys_to_pop = set(gen_batch_shuffle1_repeated.non_tensor_batch.keys()) - reward_model_keys
+
+                    # Create clean batches for union (pop conflicting keys)
+                    batch_shuffle1_clear = gen_batch_shuffle1_repeated.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+                    )
+                    batch_shuffle2_clear = gen_batch_shuffle2_repeated.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+                    )
+
                     # Now union without conflicts
                     batch_cross1 = gen_batch_shuffle1_repeated.union(gen_batch_output2)
                     batch_cross2 = gen_batch_shuffle2_repeated.union(gen_batch_output1)
