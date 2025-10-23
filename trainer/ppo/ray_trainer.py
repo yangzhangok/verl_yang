@@ -1028,28 +1028,27 @@ class RayPPOTrainer:
 
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output  
-                    
+                            del gen_baseline_batch, gen_baseline_output
+
                 # Convert multi_modal_inputs to multi_modal_data format for vLLM
-                if "multi_modal_inputs" in batch.non_tensor_batch:
-                    multi_modal_data_list = []
+                if "multi_modal_inputs" in gen_batch_output.non_tensor_batch:
                     
                     # Check if we're using preprocessed embeddings
                     use_preprocessed = False
-                    if batch.non_tensor_batch["multi_modal_inputs"] is not None:
+                    if gen_batch_output.non_tensor_batch["multi_modal_inputs"] is not None:
                         # Check if any item in the batch uses preprocessed embeddings
-                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                        for multi_modal_input in gen_batch_output.non_tensor_batch["multi_modal_inputs"]:
                             if isinstance(multi_modal_input, dict) and multi_modal_input.get("use_preprocessed_embeddings", False):
                                 use_preprocessed = True
                                 break
                     
                     # Process all multi_modal_inputs to embeddings using actor worker
-                    if batch.non_tensor_batch["multi_modal_inputs"] is not None and not use_preprocessed:
+                    if gen_batch_output.non_tensor_batch["multi_modal_inputs"] is not None and not use_preprocessed:
                         try:
                             # Create DataProto for batch processing - directly use the entire gen_batch
                             multi_modal_data_proto = DataProto.from_dict(
                                 tensors={},  # No tensor data needed for this operation
-                                non_tensors={"multi_modal_inputs": batch.non_tensor_batch["multi_modal_inputs"]},
+                                non_tensors={"multi_modal_inputs": gen_batch_output.non_tensor_batch["multi_modal_inputs"]},
                                 meta_info={}
                             )
                             
@@ -1057,7 +1056,7 @@ class RayPPOTrainer:
                             processed_data_proto = self.actor_rollout_wg.process_pixel_values_to_embeddings(multi_modal_data_proto)
                             
                             # Update the original gen_batch with processed results
-                            batch.non_tensor_batch["multi_modal_inputs"] = processed_data_proto.non_tensor_batch["multi_modal_inputs"]
+                            gen_batch_output.non_tensor_batch["multi_modal_inputs"] = processed_data_proto.non_tensor_batch["multi_modal_inputs"]
                                 
                         except Exception as e:
                             import traceback
@@ -1068,19 +1067,6 @@ class RayPPOTrainer:
                     elif use_preprocessed:
                         print("Using preprocessed embeddings, skipping real-time processing")
                     
-                    # Convert to vLLM format after processing
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        # Convert to vLLM format
-                        multi_modal_data = {
-                            "image": {
-                                "image_embeds": multi_modal_input["image_embeddings"].to(torch.float32),
-                            }
-                        }
-                        multi_modal_data_list.append(multi_modal_data)
-                    
-                    # Replace multi_modal_inputs with multi_modal_data
-                    batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
-                    del batch.non_tensor_batch["multi_modal_inputs"]
 
 
                     # Create two different shuffle versions

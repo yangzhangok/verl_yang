@@ -471,6 +471,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
+        from torch.nn import Embedding
+
+        # 在auto_wrap_policy中加入embedding
+        policies = auto_wrap_policy.keywords["policies"]      # [partial(transformer_auto_wrap_policy, ...), ...]
+        trans_policy = policies[0]
+        cls_set = set(trans_policy.keywords.get("transformer_layer_cls", set()))
+        cls_set.add(Embedding)                                # 关键：用“类对象”而不是 YAML 字符串
+        trans_policy.keywords["transformer_layer_cls"] = cls_set
+        # 在auto_wrap_policy中加入embedding
+        
+        #import ipdb;ipdb.set_trace()
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
                 actor_module,
@@ -1104,6 +1115,62 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def process_pixel_values_to_embeddings(self, multi_modal_inputs: DataProto) -> DataProto:
+        """
+        Process pixel_values to embeddings for a single multi-modal input.
+        This is a wrapper function that delegates to the actor's implementation.
+        
+        Args:
+            multi_modal_inputs: DataProto containing pixel_values and other multi-modal data
+            
+        Returns:
+            DataProto with processed embeddings and other data
+        """
+        
+        # Debug information
+        print(f"DEBUG: self._is_actor = {self._is_actor}")
+        print(f"DEBUG: self.role = {self.role}")
+        print(f"DEBUG: hasattr(self, 'actor') = {hasattr(self, 'actor')}")
+        if hasattr(self, 'actor'):
+            print(f"DEBUG: self.actor is None = {self.actor is None}")
+        
+        if not self._is_actor:
+            raise RuntimeError(f"Worker role '{self.role}' is not an actor. Expected actor, actor_rollout, or actor_rollout_ref")
+        
+        if not hasattr(self, 'actor') or self.actor is None:
+            raise RuntimeError("Actor is not initialized or is None")
+        
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        
+        processed_dict = self.actor.process_pixel_values_to_embeddings(multi_modal_inputs)
+        
+        # Move to CPU to save GPU memory
+        # 手动递归移动到 CPU
+        def recursive_to_cpu(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.cpu()  # 或 .to('cpu')
+            elif isinstance(obj, dict):
+                return {k: recursive_to_cpu(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [recursive_to_cpu(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return tuple(recursive_to_cpu(item) for item in obj)
+            else:
+                return obj
+
+        processed_dict.batch = recursive_to_cpu(processed_dict.batch)
+        processed_dict.non_tensor_batch = recursive_to_cpu(processed_dict.non_tensor_batch)
+        
+        # Unshard FSDP module if needed
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        
+        return processed_dict
 
 class CriticWorker(Worker, DistProfilerExtension):
     def __init__(self, config: FSDPCriticConfig):

@@ -224,12 +224,14 @@ class DataParallelPPOActor(BasePPOActor):
         """
         # If only partial multimodal embeds are provided, construct full inputs_embeds from input_ids
 
+        #import ipdb; ipdb.set_trace()
         if "inputs_embeds" not in micro_batch and "multi_modal_inputs" in micro_batch:
-            mm = micro_batch["multi_modal_inputs"] or {}
-            has_img = "image_embeddings" in mm and mm["image_embeddings"] is not None
-            has_vid = "video_embeddings" in mm and mm["video_embeddings"] is not None
-            if has_img or has_vid:
+            mm = micro_batch["multi_modal_inputs"]
+            has_img = "image_embeddings" in mm[0] and mm[0]["image_embeddings"] is not None
+            if has_img:
                 input_ids = micro_batch["input_ids"]
+                bs, seqlen = input_ids.shape
+                
                 # 1) get token embeddings
                 get_emb_module = None
                 if hasattr(self.actor_module, "get_input_embeddings"):
@@ -238,41 +240,51 @@ class DataParallelPPOActor(BasePPOActor):
                     get_emb_module = self.actor_module.model.get_input_embeddings()
                 if get_emb_module is None:
                     raise RuntimeError("Model does not expose get_input_embeddings() to build inputs_embeds")
+                #
                 token_embeds = get_emb_module(input_ids)
-
+                #import ipdb; ipdb.set_trace()
                 # 2) scatter image/video embeddings into placeholder token positions
                 model_cfg = getattr(self.actor_module, "config", getattr(getattr(self.actor_module, "model", None), "config", None))
                 image_token_id = getattr(model_cfg, "image_token_id", None)
-                video_token_id = getattr(model_cfg, "video_token_id", None)
 
                 inputs_embeds = token_embeds
-                if has_img:
-                    if image_token_id is None:
-                        raise RuntimeError("image_token_id not found in model config; cannot place image embeddings")
-                    img_embeds = mm["image_embeddings"].to(inputs_embeds.device, inputs_embeds.dtype)
-                    mask = (input_ids == image_token_id)
-                    num_tokens = int(mask.sum().item())
-                    if img_embeds.dim() == 3:
-                        img_embeds = img_embeds.reshape(-1, img_embeds.size(-1))
-                    if img_embeds.size(0) != num_tokens:
-                        raise ValueError(f"Image features ({img_embeds.size(0)}) do not match image tokens ({num_tokens})")
-                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, img_embeds)
+                def _place_one_kind(key_name: str, placeholder_id: int | None):
+                    if placeholder_id is None:
+                        return
+                    H = inputs_embeds.size(-1)
+                    with torch.no_grad():  # 只针对“赋值”关闭 grad，不影响后续前向/反传
+                        for i in range(bs):
+                            feats = mm[i].get(key_name, None)
+                            if feats is None:
+                                continue
 
-                if has_vid:
-                    if video_token_id is None:
-                        raise RuntimeError("video_token_id not found in model config; cannot place video embeddings")
-                    vid_embeds = mm["video_embeddings"].to(inputs_embeds.device, inputs_embeds.dtype)
-                    mask = (input_ids == video_token_id)
-                    num_tokens = int(mask.sum().item())
-                    if vid_embeds.dim() == 3:
-                        vid_embeds = vid_embeds.reshape(-1, vid_embeds.size(-1))
-                    if vid_embeds.size(0) != num_tokens:
-                        raise ValueError(f"Video features ({vid_embeds.size(0)}) do not match video tokens ({num_tokens})")
-                    mask_expanded = mask.unsqueeze(-1).expand_as(inputs_embeds)
-                    inputs_embeds = inputs_embeds.masked_scatter(mask_expanded, vid_embeds)
+                            # 统一形状为 (N, H)
+                            if feats.dim() == 3:
+                                feats = feats.reshape(-1, feats.size(-1))
+                            if feats.dim() != 2 or feats.size(-1) != H:
+                                raise ValueError(f"{key_name} for sample {i} has shape {tuple(feats.shape)}, expect (*, {H})")
 
-                micro_batch["inputs_embeds"] = inputs_embeds
+                            # 只有不匹配时才转换，避免重复分配
+                            if feats.device != inputs_embeds.device or feats.dtype != inputs_embeds.dtype:
+                                feats = feats.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype, non_blocking=True)
+
+                            mask_i = (input_ids[i] == placeholder_id)  # (S,)
+                            # 避免频繁 host 同步：直接拿索引长度，而非 .sum().item()
+                            idx = mask_i.nonzero(as_tuple=False).squeeze(1)  # (N,)
+                            if idx.numel() != feats.size(0):
+                                raise ValueError(
+                                    f"{key_name} count mismatch for sample {i}: features={feats.size(0)} vs placeholders={idx.numel()}"
+                                )
+
+                            # 大 N 时可分块写，避免一次性索引带来的显存峰值（可选）
+                            step = 2048  # 可按需要调整
+                            for j in range(0, idx.numel(), step):
+                                sl = slice(j, j + step)
+                                inputs_embeds[i, idx[sl]].copy_(feats[sl])  # 原地 copy_，不产生额外大张量
+                                    
+                            _place_one_kind("image_embeddings", image_token_id)
+            #del micro_batch["multi_modal_inputs"]
+            micro_batch["inputs_embeds"] = inputs_embeds
 
         # Dispatch to inputs_embeds path if provided (either precomputed or just constructed above)
         if "inputs_embeds" in micro_batch:
@@ -678,6 +690,7 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
+        #import ipdb; ipdb.set_trace()
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         if use_dynamic_bsz:

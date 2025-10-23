@@ -119,7 +119,7 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         
         # Support for preprocessed embeddings
-        self.use_preprocessed_embeddings = config.get("use_preprocessed_embeddings", True)
+        self.use_preprocessed_embeddings = config.get("use_preprocessed_embeddings", False)
         self.embedding_key = config.get("embedding_key", "image_embeddings")
 
         self._download()

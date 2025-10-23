@@ -1,7 +1,6 @@
 # Target class for this configuration
 _target_: verl.workers.config.FSDPEngineConfig
 
-# policy for wrapping the model
 wrap_policy:
   transformer_layer_cls_to_wrap:
     - Qwen2_5_VisionTransformerPretrainedModel

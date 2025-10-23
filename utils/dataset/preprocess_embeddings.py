@@ -37,6 +37,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from qwen_vl_utils import process_vision_info
 
 import numpy as np
 import pandas as pd
@@ -44,7 +45,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from verl.utils.fs import copy_to_local
 
@@ -64,24 +65,32 @@ class ImageEmbeddingDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # Extract image data
+        # 添加数据验证
+        if self.image_key not in row:
+            raise KeyError(f"Image key '{self.image_key}' not found in row {idx}")
+        
         image_data = row[self.image_key]
         
-        # Handle different image data formats
+        # 更严格的图像数据验证
+        if image_data is None:
+            raise ValueError(f"Image data is None at index {idx}")
+        
+        # 处理多图像情况
         if isinstance(image_data, (list, tuple)):
-            # Multiple images - take the first one for now
+            if len(image_data) == 0:
+                raise ValueError(f"Empty image list at index {idx}")
             image_data = image_data[0]
         
-        # Convert to tensor if needed
+        # 验证图像数据格式
         if isinstance(image_data, np.ndarray):
+            if image_data.size == 0:
+                raise ValueError(f"Empty image array at index {idx}")
             image_data = torch.from_numpy(image_data)
         elif not isinstance(image_data, torch.Tensor):
-            # Try to convert from other formats
             try:
                 image_data = torch.tensor(image_data)
             except Exception as e:
-                logger.warning(f"Failed to convert image data at index {idx}: {e}")
-                return None
+                raise ValueError(f"Invalid image data format at index {idx}: {e}") from e
         
         return {
             'index': idx,
@@ -124,7 +133,7 @@ class ImageEmbeddingProcessor:
         )
         
         # Load model
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             local_model_path,
             torch_dtype=torch.float16,
             device_map=self.device,
@@ -136,63 +145,86 @@ class ImageEmbeddingProcessor:
         
         logger.info("Model loaded successfully")
     
-    def process_batch(self, batch_data: List[Dict]) -> List[torch.Tensor]:
-        """Process a batch of images to embeddings."""
+    @torch.inference_mode()
+    def process_batch(
+        self,
+        batch_data: List[Dict],
+        image_key: str = "images",
+    ) -> Tuple[List[int], List[torch.Tensor]]:
+        """
+        返回:
+          indices: 与 embeddings 一一对应的原始行索引列表
+          embeddings: 每张图的原始token序列 (变长)
+        """
         if not batch_data:
-            return []
+            return [], []
+
+        # 1) 过滤 None，并抽取每条样本的"第一张图片"
+        msgs, indices = [], []
+        for item in batch_data:
+            if item is None:
+                continue
+            row = item.get("row_data", {})
+            img_field = row.get(image_key, item.get("image_data"))
+            if img_field is None:
+                continue
+            # 多图只取第一张
+            img = img_field[0] if isinstance(img_field, (list, tuple)) and len(img_field) > 0 else img_field
+
+            # 组装一条"只含图片"的消息
+            msgs.append({"role": "user", "content": [{"type": "image", "image": img}]})
+            indices.append(item["index"])  # 使用原始索引
+
+        if not msgs:
+            return [], []
+
+        # 2) Processor 统一预处理
+        texts = self.processor.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+        images, _ = process_vision_info(msgs)
+        inputs = self.processor(
+            text=texts,
+            images=images,
+            padding=True,
+            return_tensors="pt",
+        ).to(self.model.device)
+
+        # 3) 视觉编码
+        image_embeds = self.model.visual(
+            inputs.pixel_values, grid_thw=inputs.image_grid_thw
+        )   # [sum_tokens, hidden]
+
+        # 4) 按每张图的 token 数切分
+        grid = inputs.image_grid_thw  # [num_images, 3] -> (T,H,W)
+        token_counts = (grid[:, 0] * grid[:, 1] * grid[:, 2]).tolist()
         
-        # Filter out None values
-        valid_batch = [item for item in batch_data if item is not None]
-        if not valid_batch:
-            return []
+        # 确保token_counts与图像数量匹配
+        if len(token_counts) != len(msgs):
+            logger.error(f"Token count mismatch: {len(token_counts)} vs {len(msgs)}")
+            return [], []
         
-        try:
-            # Extract image data
-            images = [item['image_data'] for item in valid_batch]
-            
-            # Process images
-            processed_images = []
-            for img in images:
-                # Ensure image is in correct format
-                if img.dim() == 3:  # (C, H, W)
-                    img = img.unsqueeze(0)  # Add batch dimension
-                elif img.dim() == 4:  # (B, C, H, W)
-                    pass  # Already has batch dimension
-                else:
-                    logger.warning(f"Unexpected image shape: {img.shape}")
-                    continue
-                
-                processed_images.append(img)
-            
-            if not processed_images:
-                return []
-            
-            # Stack images
-            batch_images = torch.cat(processed_images, dim=0)
-            
-            # Move to device
-            batch_images = batch_images.to(self.device)
-            
-            # Process with visual encoder
-            with torch.no_grad():
-                # Use the model's visual encoder
-                if hasattr(self.model, 'visual'):
-                    # Convert to correct dtype
-                    batch_images = batch_images.type(self.model.visual.dtype)
-                    embeddings = self.model.visual(batch_images)
-                else:
-                    logger.error("Model does not have visual encoder")
-                    return []
-            
-            # Move back to CPU and split
-            embeddings = embeddings.cpu()
-            embeddings_list = [embeddings[i] for i in range(embeddings.size(0))]
-            
-            return embeddings_list
-            
-        except Exception as e:
-            logger.error(f"Error processing batch: {e}")
-            return []
+        per_image_tokens = list(torch.split(image_embeds, token_counts, dim=0))
+
+        # 5) 保留原始token序列（不池化）
+        per_image = per_image_tokens  # 直接使用原始token序列
+
+        # 6) 转回 CPU（保持tensor格式，不转numpy）
+        per_image = [e.detach().float().cpu() for e in per_image]
+        
+        # 验证结果
+        if len(per_image) != len(indices):
+            logger.error(f"Length mismatch: {len(per_image)} embeddings vs {len(indices)} indices")
+            return [], []
+        
+        # 检查token序列形状
+        if per_image and len(per_image) > 0:
+            for i, emb in enumerate(per_image):
+                if len(emb.shape) != 2:
+                    logger.error(f"Invalid token sequence shape at index {i}: {emb.shape}, expected [num_tokens, hidden_dim]")
+                    return [], []
+
+        return indices, per_image
     
     def process_dataframe(
         self,
@@ -218,29 +250,38 @@ class ImageEmbeddingProcessor:
         # Process batches
         all_embeddings = []
         processed_indices = []
+        failed_count = 0
         
         iterator = tqdm(dataloader, desc="Processing images") if progress_bar else dataloader
         
-        for batch in iterator:
-            embeddings = self.process_batch(batch)
-            
-            # Store embeddings
-            for i, embedding in enumerate(embeddings):
-                if embedding is not None:
+        for batch_idx, batch in enumerate(iterator):
+            try:
+                # 过滤掉None值
+                valid_batch = [item for item in batch if item is not None]
+                if not valid_batch:
+                    continue
+                    
+                indices, embeddings = self.process_batch(valid_batch, image_key)
+                
+                # 存储嵌入向量 - 使用正确的索引映射
+                for idx, embedding in zip(indices, embeddings):
                     all_embeddings.append(embedding)
-                    processed_indices.append(batch[i]['index'])
+                    processed_indices.append(idx)
+                    
+            except Exception as e:
+                logger.error(f"Failed to process batch {batch_idx}: {e}")
+                failed_count += len(batch)
+                continue
         
         # Create new dataframe with embeddings
         result_df = df.copy()
-        
-        # Initialize embeddings column
         result_df['image_embeddings'] = None
         
-        # Fill in embeddings
+        # Fill in embeddings - 使用正确的索引映射
         for idx, embedding in zip(processed_indices, all_embeddings):
             result_df.at[idx, 'image_embeddings'] = embedding
         
-        logger.info(f"Processed {len(all_embeddings)} embeddings successfully")
+        logger.info(f"Processed {len(all_embeddings)} embeddings successfully, {failed_count} failed")
         
         return result_df
 
