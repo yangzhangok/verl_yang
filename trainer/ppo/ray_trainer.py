@@ -1026,7 +1026,8 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
-
+        #model_cfg = getattr(self.actor_rollout_wg.actor.actor_module, "config", getattr(getattr(self.actor_rollout_wg.actor.actor_module, "model", None), "config", None))
+        image_token_id = 151655 #getattr(model_cfg, "image_token_id", None)
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1053,10 +1054,6 @@ class RayPPOTrainer:
                 # Instead of simple repeat, create two different shuffle versions
                 n_samples = self.config.actor_rollout_ref.rollout.n
                 n_samples_per_shuffle = n_samples // 2
-                
-                # Create two copies of gen_batch for different shuffles
-                gen_batch_shuffle1 = deepcopy(gen_batch)
-                gen_batch_shuffle2 = deepcopy(gen_batch)
                 
                 # Convert multi_modal_inputs to multi_modal_data format for vLLM
                 if "multi_modal_inputs" in gen_batch.non_tensor_batch:
@@ -1098,7 +1095,7 @@ class RayPPOTrainer:
                     
                     # Replace multi_modal_inputs with multi_modal_data
                     gen_batch.non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
-                    del gen_batch.non_tensor_batch["multi_modal_inputs"]
+                    #del gen_batch.non_tensor_batch["multi_modal_inputs"]
                     
                     # Create two different shuffle versions
                     def create_shuffled_gen_batch(base_gen_batch, shuffle_seed):
@@ -1213,24 +1210,6 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-                    
-                    # Cross-correspondence: shuffle1 batch + shuffle2 output, shuffle2 batch + shuffle1 output
-                    # Define keys to preserve from reward model and keys to pop to avoid conflicts
-                    reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & gen_batch_shuffle1_repeated.non_tensor_batch.keys()
-                    
-                    # Pop conflicting keys from batch_shuffle before union
-                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                    non_tensor_batch_keys_to_pop = set(gen_batch_shuffle1_repeated.non_tensor_batch.keys()) - reward_model_keys
-                    
-                    # Create clean batches for union (pop conflicting keys)
-                    batch_shuffle1_clear = gen_batch_shuffle1_repeated.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-                    )
-                    batch_shuffle2_clear = gen_batch_shuffle2_repeated.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-                    )
                     
                     # Now union without conflicts
                     batch_cross1 = gen_batch_shuffle1_repeated.union(gen_batch_output2)

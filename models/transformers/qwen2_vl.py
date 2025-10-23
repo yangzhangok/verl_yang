@@ -420,9 +420,10 @@ def qwen2_vl_base_forward(
     video_grid_thw: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
-    kwargs["inputs_embeds"], kwargs["attention_mask"] = _get_input_embeds(
-        self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
-    )  # avoid lora module having multiple keyword arguments
+    if kwargs["inputs_embeds"] is None:
+        kwargs["inputs_embeds"], kwargs["attention_mask"] = _get_input_embeds(
+            self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
+        )  # avoid lora module having multiple keyword arguments
     return self.language_model(
         input_ids=None,
         **kwargs,

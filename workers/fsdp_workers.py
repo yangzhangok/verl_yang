@@ -472,19 +472,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         
-        if fsdp_strategy == "fsdp":
+        from torch.nn import Embedding
 
-            # actor_module.visual = FSDP(
-            #     actor_module.visual,
-            #     param_init_fn=init_fn,
-            #     sharding_strategy=sharding_strategy,
-            #     mixed_precision=mixed_precision,
-            #     device_id=get_device_id(),
-            #     device_mesh=self.device_mesh,
-            #     use_orig_params=True,                   # ✅ 强烈建议 True
-            #     cpu_offload=cpu_offload,
-            #     forward_prefetch=fsdp_config.get("forward_prefetch", False),
-            # )
+        # 在auto_wrap_policy中加入embedding
+        policies = auto_wrap_policy.keywords["policies"]      # [partial(transformer_auto_wrap_policy, ...), ...]
+        trans_policy = policies[0]
+        cls_set = set(trans_policy.keywords.get("transformer_layer_cls", set()))
+        cls_set.add(Embedding)                                # 关键：用“类对象”而不是 YAML 字符串
+        trans_policy.keywords["transformer_layer_cls"] = cls_set
+        # 在auto_wrap_policy中加入embedding
+
+        #import ipdb;ipdb.set_trace()
+        if fsdp_strategy == "fsdp":
 
             actor_module_fsdp = FSDP(
                 actor_module,
